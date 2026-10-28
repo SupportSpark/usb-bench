@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.1.0"
+VERSION="1.2.0"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -175,54 +175,6 @@ ensure_deps() {
   fi
   return $rc
 }
-
-env_selfcheck() {
-  tit "环境自检"
-  local mgr kver eng
-  mgr=$(detect_pkg_mgr)
-  kver=$(uname -r)
-  eng="$IOENGINE"
-
-  printf '  %-18s %s\n' "包管理器" "$mgr"
-  printf '  %-18s %s\n' "内核版本" "$kver"
-  if [[ $EUID -eq 0 ]]; then
-    printf '  %-18s %s\n' "运行身份" "root（完整功能）"
-  else
-    printf '  %-18s %s\n' "运行身份" "普通用户（smartctl/挂载受限）"
-  fi
-  printf '  %-18s %s\n' "I/O 引擎" "$eng"
-
-  printf '\n  %-14s %-8s %s\n' "组件" "状态" "版本/说明"
-  hr
-  local c v
-  for c in fio jq smartctl lsusb lspci dmidecode hdparm nvme; do
-    if command -v "$c" >/dev/null 2>&1; then
-      case "$c" in
-        fio) v=$(fio --version 2>/dev/null) ;;
-        jq)  v=$(jq --version 2>/dev/null) ;;
-        *)   v=$(command -v "$c") ;;
-      esac
-      printf '  %-14s %s%-6s%s %s\n' "$c" "$G" "OK" "$N" "$v"
-    else
-      printf '  %-14s %s%-6s%s 未安装（功能降级）\n' "$c" "$Y" "MISS" "$N"
-    fi
-  done
-  hr
-
-  if fio --enghelp 2>/dev/null | grep -qw io_uring; then
-    ok "io_uring 可用"
-  else
-    wrn "io_uring 不可用，将回退 libaio"
-  fi
-  if dd if=/dev/zero of=/tmp/.ub_probe bs=1M count=4 oflag=direct 2>/dev/null; then
-    ok "O_DIRECT 可用（能绕过页缓存做准确测试）"
-  else
-    wrn "O_DIRECT 探针失败，测试可能受页缓存影响"
-  fi
-  rm -f /tmp/.ub_probe 2>/dev/null
-  return 0
-}
-
 
 #------------------------------ 链路理论值 ------------------------------------
 link_theory() {
@@ -1154,44 +1106,48 @@ run_everything() {
   run_suite
 }
 
+menu_item() {  # 编号 名称 [颜色]
+  local n=$1 name=$2 col=${3:-$W}
+  printf '   %s%2s.%s %s%s%s\n' "$Y" "$n" "$N" "$col" "$name" "$N"
+}
+
+
 main_menu() {
   while true; do
     clear 2>/dev/null || true
     hr2
-    printf '   USB / UASP 外置存储 · 链路极限速率一键测试   v%s\n' "$VERSION"
+    printf '   USB 外置存储 · 链路极限速率测试   v%s\n' "$VERSION"
     hr2
-    printf '   主机  %-22s 内核  %s\n' "$(hostname)" "$(uname -r)"
-    printf '   设备  已识别 %d 块 · 已选择 %d 块\n' "${#DEV_LIST[@]}" "${#SEL[@]}"
-    printf '   参数  %sGB 文件 · %ss 随机 · 写入%s · 引擎 %s\n' \
+    printf "   ${DK}主机${N} %-20s ${DK}内核${N} %s\n" "$(hostname)" "$(uname -r)"
+    printf "   ${DK}设备${N} 已识别 %d 块 · 已选择 %d 块\n" "${#DEV_LIST[@]}" "${#SEL[@]}"
+    printf "   ${DK}参数${N} %sGB · %ss · 写入%s · %s\n" \
       "$FILE_GB" "$RUNTIME" "$([[ $DO_WRITE -eq 1 ]] && echo 开 || echo 关)" "$IOENGINE"
-    hr2
+    hr
     echo
-    echo "    快速开始 ────────────────────────────────────────────"
-    echo "      1) 一键全流程   系统信息 + 拓扑审计 + 全部测试 + 报告   ★推荐"
-    echo "      2) 快速体检     系统信息 + 拓扑 + 轻量测试（约 1 分钟/盘）"
+    menu_item 1 "一键全流程测试" "$C"
+    menu_item 2 "快速体检"
+    menu_item 3 "系统信息查询"
+    menu_item 4 "USB 拓扑审计"
+    menu_item 5 "性能测试"
+    menu_item 6 "多盘并发测试"
+    menu_item 7 "选择测试设备"
+    menu_item 8 "参数设置"
+    menu_item 9 "历史报告"
+    menu_item 0 "退出"
     echo
-    echo "    单项功能 ────────────────────────────────────────────"
-    echo "      3) 系统与硬件信息   CPU / 内存 / 显卡 / 磁盘 / PCIe 链路"
-    echo "      4) USB 拓扑审计     链路速率 / UASP / SATA 协商 / 端口"
-    echo "      5) 性能测试         选档位后跑全项目"
-    echo "      6) 多盘并发         链路共享总带宽"
-    echo
-    echo "    配置与查看 ──────────────────────────────────────────"
-    echo "      7) 选择测试设备"
-    echo "      8) 参数设置"
-    echo "      9) 历史报告"
-    echo "     10) 环境自检与修复"
-    echo "      0) 退出"
+    printf "   ${DK}提示 1=全流程 · 3=看硬件 · 4=查链路 · 6=测并发${N}\n"
     echo
     printf '   请选择: '
     local c; read -r c
     case "$c" in
-      1) pick_preset || continue; pick_engine; run_everything; printf '\n   回车继续...'; read -r _ ;;
-      2) QUICK=1; FULL=0; FILE_GB=8; RUNTIME=10; pick_engine
-         show_system_info text; enumerate_devices; audit_topology; run_suite
+      1) pick_preset || continue; pick_engine; run_everything
          printf '\n   回车继续...'; read -r _ ;;
-      3) enumerate_devices; show_system_info text; printf '   回车继续...'; read -r _ ;;
-      4) enumerate_devices; audit_topology; printf '   回车继续...'; read -r _ ;;
+      2) QUICK=1; FULL=0; FILE_GB=8; RUNTIME=10; pick_engine; run_everything
+         printf '\n   回车继续...'; read -r _ ;;
+      3) enumerate_devices; show_system_info text
+         printf '   回车继续...'; read -r _ ;;
+      4) enumerate_devices; audit_topology
+         printf '   回车继续...'; read -r _ ;;
       5) pick_preset || continue; pick_engine; enumerate_devices; run_suite
          printf '\n   回车继续...'; read -r _ ;;
       6) pick_engine; enumerate_devices; start_run; bench_multi read; gen_report; cleanup_mounts
@@ -1199,12 +1155,12 @@ main_menu() {
       7) choose_devices ;;
       8) set_params ;;
       9) show_results_dir ;;
-      10) ensure_deps; env_selfcheck; printf '   回车继续...'; read -r _ ;;
       0) printf '\n   再见。\n\n'; exit 0 ;;
       *) ;;
     esac
   done
 }
+
 
 #------------------------------ 入口 ------------------------------------------
 usage() {
