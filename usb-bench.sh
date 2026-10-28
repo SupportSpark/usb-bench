@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.2.0"
+VERSION="1.3.0"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -30,6 +30,21 @@ wrn()  { printf '  %s[WARN]%s %s\n' "$Y" "$N" "$*"; }
 err()  { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; }
 die()  { err "$*"; exit 1; }
 tit()  { printf '\n%s%s%s\n' "$BD$M" "$*" "$N"; hr; }
+
+# 交互读取：优先 /dev/tty，保证 curl | sudo bash 管道方式下菜单仍可用
+ask() {
+  local __a=""
+  # 有控制终端就用 /dev/tty（管道执行时菜单仍可交互）；
+  # 无控制终端（CI/无 tty 的 ssh）自动回退到 stdin，避免阻塞。
+  if { exec 3<>/dev/tty; } 2>/dev/null; then
+    IFS= read -r __a <&3 || __a=""
+    exec 3<&- 2>/dev/null
+  else
+    IFS= read -r __a || __a=""
+  fi
+  printf '%s' "$__a"
+}
+
 
 BASE_DIR="${USB_BENCH_HOME:-$HOME/.usb-bench}"
 OUT_ROOT="${USB_BENCH_REPORTS:-$HOME/usb-bench-reports}"
@@ -58,6 +73,7 @@ DEVICE_FILTER=""
 TEST_DIR_OVERRIDE=""
 INCLUDE_NONUSB=0
 SYSINFO_ONLY=0
+UPDATE_ONLY=0
 NO_SYSINFO=0
 NO_INSTALL=0
 
@@ -1015,7 +1031,7 @@ choose_devices() {
     hr2; printf '              选择测试目标设备\n'; hr2
     list_devices
     printf '\n  输入编号(空格分隔，如 1 3)、a=全选、n=全不选、回车返回: '
-    local in; read -r in
+    local in; in=$(ask)
     [[ -z "$in" ]] && return
     case "$in" in
       a|A|all) SEL=("${DEV_LIST[@]}"); continue ;;
@@ -1046,14 +1062,14 @@ set_params() {
     printf '  6) 统一测试目录     当前: %s\n' "${TEST_DIR_OVERRIDE:-<自动>}"
     printf '  7) 包含内置盘       当前: %s\n' "$([[ $INCLUDE_NONUSB -eq 1 ]] && echo 是 || echo 否)"
     printf '\n  0) 返回\n'
-    printf '\n  选择: '; local c v; read -r c
+    printf '\n  选择: '; local c v; c=$(ask)
     case "$c" in
-      1) printf '  输入 GB (2-64): '; read -r v; if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=2&&v<=64)); then FILE_GB=$v; fi ;;
-      2) printf '  输入秒 (5-300): '; read -r v; if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=5&&v<=300)); then RUNTIME=$v; fi ;;
+      1) printf '  输入 GB (2-64): '; v=$(ask); if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=2&&v<=64)); then FILE_GB=$v; fi ;;
+      2) printf '  输入秒 (5-300): '; v=$(ask); if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=5&&v<=300)); then RUNTIME=$v; fi ;;
       3) DO_WRITE=$(( 1 - DO_WRITE )) ;;
       4) AUTO_MOUNT=$(( 1 - AUTO_MOUNT )) ;;
-      5) printf '  引擎 (libaio/io_uring/psync): '; read -r v; if [[ -n "$v" ]]; then IOENGINE=$v; fi ;;
-      6) printf '  绝对路径（留空取消）: '; read -r v; if [[ -d "$v" ]]; then TEST_DIR_OVERRIDE=$v; else TEST_DIR_OVERRIDE=""; fi ;;
+      5) printf '  引擎 (libaio/io_uring/psync): '; v=$(ask); if [[ -n "$v" ]]; then IOENGINE=$v; fi ;;
+      6) printf '  绝对路径（留空取消）: '; v=$(ask); if [[ -d "$v" ]]; then TEST_DIR_OVERRIDE=$v; else TEST_DIR_OVERRIDE=""; fi ;;
       7) INCLUDE_NONUSB=$(( 1 - INCLUDE_NONUSB )); enumerate_devices ;;
       0) return ;;
     esac
@@ -1069,7 +1085,7 @@ show_results_dir() {
     printf '  [%d] %s\n      %s\n' "$i" "$(basename "$d")" "$(ls "$d" 2>/dev/null | tr '\n' ' ')"
     i=$((i+1))
   done
-  printf '\n  输入编号查看报告（回车返回）: '; local c; read -r c
+  printf '\n  输入编号查看报告（回车返回）: '; local c; c=$(ask)
   if [[ "$c" =~ ^[0-9]+$ ]]; then
     local p; p=$(ls -1d "$OUT_ROOT"/*/ 2>/dev/null | sort -r | sed -n "${c}p")
     if [[ -n "$p" && -f "$p/报告.md" ]]; then
@@ -1090,7 +1106,7 @@ pick_preset() {
   echo "     0) 返回"
   echo
   printf '   请选择: '
-  local c; read -r c
+  local c; c=$(ask)
   case "$c" in
     1) QUICK=1; FULL=0; FILE_GB=8;  RUNTIME=10; return 0 ;;
     2) QUICK=0; FULL=0; FILE_GB=16; RUNTIME=30; return 0 ;;
@@ -1105,6 +1121,103 @@ run_everything() {
   audit_topology
   run_suite
 }
+
+
+#------------------------------ 自更新 ----------------------------------------
+INSTALL_PATH="/usr/local/bin/usb-bench"
+UPD_URL="${USB_BENCH_URL:-https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh}"
+UPD_MARK="USB 外置存储"
+
+http_get() {
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL --connect-timeout 8 --max-time 30 "$1" 2>/dev/null
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO- --timeout=30 "$1" 2>/dev/null
+  else
+    return 127
+  fi
+}
+
+self_path() {
+  local s="$SELF"
+  if [[ -f "$s" && ! -L "$s" && "$s" != /dev/fd/* && "$s" != /proc/* ]] \
+     && grep -q "usb-bench.sh" "$s" 2>/dev/null; then
+    printf '%s' "$s"
+  else
+    printf '%s' "$INSTALL_PATH"
+  fi
+}
+
+ver_newer() {
+  [[ "$1" == "$2" ]] && return 1
+  [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V 2>/dev/null | tail -1)" == "$1" ]]
+}
+
+do_update() {
+  local target tmp rver lver
+  tit "检查更新"
+  target=$(self_path)
+  inf "上游地址: $UPD_URL"
+  inf "安装位置: $target"
+
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    err "缺少 curl 或 wget，无法检查更新"
+    err "请先安装：sudo apt install -y curl   （或 dnf/pacman 对应命令）"
+    return 1
+  fi
+
+  tmp=$(mktemp /tmp/usb-bench.XXXXXX) || { err "无法创建临时文件"; return 1; }
+  if ! http_get "$UPD_URL" > "$tmp"; then
+    rm -f "$tmp"
+    err "拉取失败，请检查网络、代理或仓库地址"
+    return 1
+  fi
+
+  if ! grep -q "$UPD_MARK" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+    err "下载内容校验失败（不是本脚本），已放弃"
+    return 1
+  fi
+
+  rver=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -1)
+  lver="$VERSION"
+  if [[ -z "$rver" ]]; then
+    rm -f "$tmp"; err "无法解析上游版本号"; return 1
+  fi
+
+  if [[ "$rver" == "$lver" ]]; then
+    rm -f "$tmp"
+    ok "当前 v$lver 已是最新版本"
+    return 0
+  fi
+  if ! ver_newer "$rver" "$lver"; then
+    rm -f "$tmp"
+    wrn "上游 v$rver 不高于当前 v$lver，保持现状"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$target")" 2>/dev/null || true
+  if [[ -f "$target" ]]; then
+    cp -f "$target" "$target.bak" 2>/dev/null && inf "已备份旧版本: $target.bak"
+  fi
+
+  if install -m 755 "$tmp" "$target" 2>/dev/null \
+     || { cp -f "$tmp" "$target" && chmod 755 "$target"; }; then
+    rm -f "$tmp"
+    ok "更新完成: v$lver → v$rver"
+    if [[ "$target" != "$SELF" ]]; then
+      inf "下次可直接运行: sudo $target"
+    else
+      inf "重新运行脚本即生效"
+    fi
+    return 0
+  fi
+
+  rm -f "$tmp"
+  err "写入失败: $target（权限不足？）"
+  return 1
+}
+
 
 menu_item() {  # 编号 名称 [颜色]
   local n=$1 name=$2 col=${3:-$W}
@@ -1133,28 +1246,31 @@ main_menu() {
     menu_item 7 "选择测试设备"
     menu_item 8 "参数设置"
     menu_item 9 "历史报告"
+    menu_item 10 "一键更新脚本"
     menu_item 0 "退出"
     echo
     printf "   ${DK}提示 1=全流程 · 3=看硬件 · 4=查链路 · 6=测并发${N}\n"
     echo
     printf '   请选择: '
-    local c; read -r c
+    local c; c=$(ask)
     case "$c" in
       1) pick_preset || continue; pick_engine; run_everything
-         printf '\n   回车继续...'; read -r _ ;;
+         printf '\n   回车继续...'; ask >/dev/null ;;
       2) QUICK=1; FULL=0; FILE_GB=8; RUNTIME=10; pick_engine; run_everything
-         printf '\n   回车继续...'; read -r _ ;;
+         printf '\n   回车继续...'; ask >/dev/null ;;
       3) enumerate_devices; show_system_info text
-         printf '   回车继续...'; read -r _ ;;
+         printf '   回车继续...'; ask >/dev/null ;;
       4) enumerate_devices; audit_topology
-         printf '   回车继续...'; read -r _ ;;
+         printf '   回车继续...'; ask >/dev/null ;;
       5) pick_preset || continue; pick_engine; enumerate_devices; run_suite
-         printf '\n   回车继续...'; read -r _ ;;
+         printf '\n   回车继续...'; ask >/dev/null ;;
       6) pick_engine; enumerate_devices; start_run; bench_multi read; gen_report; cleanup_mounts
-         printf '\n   回车继续...'; read -r _ ;;
+         printf '\n   回车继续...'; ask >/dev/null ;;
       7) choose_devices ;;
       8) set_params ;;
       9) show_results_dir ;;
+      10) do_update
+          printf '\n   回车继续...'; ask >/dev/null ;;
       0) printf '\n   再见。\n\n'; exit 0 ;;
       *) ;;
     esac
@@ -1171,11 +1287,13 @@ usb-bench.sh v$VERSION — USB 外置存储链路极限速率一键测试
   sudo $0                 交互菜单
   sudo $0 --auto [选项]   全自动（系统信息 + 拓扑 + 测试 + 报告）
   sudo $0 --sysinfo       只看系统与硬件信息
+  sudo $0 --update        检查并更新到最新版
   sudo $0 -h              本帮助
 
 选项:
   --auto              无需交互直接跑完全流程
   --sysinfo           打印系统与硬件信息后退出
+  --update, -u        检查并更新到最新版
   --quick             快速: 8GB 文件 / 10s 随机
   --full              极限: 32GB 文件 / 60s 随机
   --size N            自定义测试文件 GB (2-64)
@@ -1198,20 +1316,32 @@ EOF
 
 main() {
   if [[ "$EUID" -ne 0 ]]; then
-    if command -v sudo >/dev/null 2>&1; then
+    # 只有当前脚本确实是本文件时才用 $SELF 提权；管道执行时 $0 是 bash，绝不能 exec 它
+    local real=""
+    if [[ -f "$SELF" ]] && grep -q "usb-bench.sh" "$SELF" 2>/dev/null; then
+      real="$SELF"
+    fi
+    if [[ -n "$real" ]] && command -v sudo >/dev/null 2>&1; then
       printf '需要 root 权限（smartctl / 挂载 / 直连块设备），正在提权...\n'
-      exec sudo -E bash "$SELF" "$@"
+      exec sudo -E bash "$real" "$@"
     else
-      printf '警告: 非 root 运行，smartctl 与自动挂载将不可用\n'
+      err "需要 root 权限，请以 sudo 运行"
+      printf '  例如: sudo bash %s\n' "$0"
+      exit 1
     fi
   fi
   mkdir -p "$BASE_DIR" "$MOUNT_ROOT" "$OUT_ROOT"
 
-  if [[ "$AUTO" -eq 1 || "$SYSINFO_ONLY" -eq 1 ]]; then
+  if [[ "$AUTO" -eq 1 || "$SYSINFO_ONLY" -eq 1 || "$UPDATE_ONLY" -eq 1 ]]; then
     clear 2>/dev/null || true
     hr2
     printf '   USB 外置存储 · 链路极限速率测试   v%s\n' "$VERSION"
     hr2
+  fi
+
+  if [[ "$UPDATE_ONLY" -eq 1 ]]; then
+    do_update
+    exit 0
   fi
 
   if [[ "$NO_INSTALL" -eq 1 && -n "$(cmds_missing $DEP_REQUIRED)" ]]; then
@@ -1220,7 +1350,7 @@ main() {
   fi
   if ! ensure_deps; then
     printf '\n  依赖不满足，无法继续。按回车退出...'
-    read -r _ || true
+    ask >/dev/null || true
     exit 1
   fi
 
@@ -1248,6 +1378,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)     usage; exit 0 ;;
     --auto)        AUTO=1 ;;
     --sysinfo)     SYSINFO_ONLY=1 ;;
+    -u|--update)   UPDATE_ONLY=1 ;;
     --no-sysinfo)  NO_SYSINFO=1 ;;
     --no-install)  NO_INSTALL=1 ;;
     --quick)       QUICK=1; FILE_GB=8; RUNTIME=10 ;;

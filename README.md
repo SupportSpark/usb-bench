@@ -8,6 +8,7 @@ USB / UASP 外置存储 —— 链路极限速率一键测试。
 
 ```
  前置检查  系统信息(CPU/内存/显卡/磁盘/PCIe) + 依赖自动安装 + 环境探测
+ 自更新    --update 一键拉取新版, 自动备份旧版
  单盘 6 项 顺序读写 1M QD8 / 4K 随机读 QD1·QD32 / 4K 随机写 QD1·QD32 / 混合 70:30
  多盘 1 项 全部选中盘并发顺序读 —— 暴露扩展坞共享上行
  全程 --direct=1，绕页缓存，测的是真链路
@@ -15,31 +16,43 @@ USB / UASP 外置存储 —— 链路极限速率一键测试。
 
 ## 一键运行
 
-```bash
-git clone https://github.com/SupportSpark/usb-bench.git
-cd usb-bench
-sudo ./usb-bench.sh
-```
-
-不想 clone，直接抓单个脚本：
+一条命令，下载即运行：
 
 ```bash
-curl -fsSL -o usb-bench.sh https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh
-chmod +x usb-bench.sh
-sudo ./usb-bench.sh
+curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash
 ```
 
-全自动无交互（跑完直接出报告）：
+脚本的交互输入走 `/dev/tty`，所以管道方式下菜单照样能操作，不用担心读不到键盘。
+
+带参数（全自动 / 只看硬件信息）：
 
 ```bash
-sudo ./usb-bench.sh --auto
+curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash -s -- --auto
+curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash -s -- --sysinfo
 ```
 
-只看机器信息，不跑测试：
+想装到本地反复用（推荐，之后可以直接 `sudo usb-bench`）：
 
 ```bash
-sudo ./usb-bench.sh --sysinfo
+sudo curl -fsSL -o /usr/local/bin/usb-bench https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh
+sudo chmod +x /usr/local/bin/usb-bench
+sudo usb-bench
 ```
+
+## 更新
+
+```bash
+sudo usb-bench.sh --update
+```
+
+或菜单里选 **10. 一键更新脚本**。逻辑：
+
+| 情况 | 行为 |
+|---|---|
+| 上游版本更高 | 备份当前为 `<路径>.bak`，替换并保持 755 权限，提示新旧版本号 |
+| 已在最新 | 直接提示，不动文件 |
+| 当前是管道运行的（没有本地文件） | 自动安装到 `/usr/local/bin/usb-bench`，之后 `sudo usb-bench` 即可 |
+| 下载内容校验不通过 | 放弃覆盖，避免把半截文件写成脚本 |
 
 ## 零配置：依赖自动装
 
@@ -81,6 +94,7 @@ PCIe 上行只有约 985 MB/s，两个 10Gbps 口加起来也突破不了这个�
    7. 选择测试设备
    8. 参数设置
    9. 历史报告
+  10. 一键更新脚本
    0. 退出
 ```
 
@@ -102,6 +116,7 @@ PCIe 上行只有约 985 MB/s，两个 10Gbps 口加起来也突破不了这个�
 ```
 --auto              无交互跑完全流程
 --sysinfo           打印系统与硬件信息后退出
+--update, -u        检查并更新到最新版
 --quick / --full    快速 / 极限预设
 --size N            测试文件 GB (2-64)
 --runtime N         随机测试秒数 (5-300)
