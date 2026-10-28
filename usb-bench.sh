@@ -1207,10 +1207,12 @@ main() {
   fi
   mkdir -p "$BASE_DIR" "$MOUNT_ROOT" "$OUT_ROOT"
 
-  clear 2>/dev/null || true
-  hr2
-  printf '   USB / UASP 外置存储 · 链路极限速率一键测试   v%s\n' "$VERSION"
-  hr2
+  if [[ "$AUTO" -eq 1 || "$SYSINFO_ONLY" -eq 1 ]]; then
+    clear 2>/dev/null || true
+    hr2
+    printf '   USB 外置存储 · 链路极限速率测试   v%s\n' "$VERSION"
+    hr2
+  fi
 
   if [[ "$NO_INSTALL" -eq 1 && -n "$(cmds_missing $DEP_REQUIRED)" ]]; then
     err "缺少必需组件且已指定 --no-install: $(cmds_missing $DEP_REQUIRED)"
