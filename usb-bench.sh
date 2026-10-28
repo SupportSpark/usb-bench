@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -24,12 +24,12 @@ fi
 
 hr()   { printf '%s\n' "${DK}----------------------------------------------------------------------------${N}"; }
 hr2()  { printf '%s\n' "${B}============================================================================${N}"; }
-ok()   { printf '  %s[ OK ]%s %s\n' "$G" "$N" "$*"; }
-inf()  { printf '  %s[ .. ]%s %s\n' "$C" "$N" "$*"; }
-wrn()  { printf '  %s[WARN]%s %s\n' "$Y" "$N" "$*"; }
-err()  { printf '  %s[FAIL]%s %s\n' "$R" "$N" "$*"; }
+ok()   { printf '  [ OK ] %s\n' "$*"; }
+inf()  { printf '  [ .. ] %s\n' "$*"; }
+wrn()  { printf '  [WARN] %s\n' "$*"; }
+err()  { printf '  [FAIL] %s\n' "$*"; }
 die()  { err "$*"; exit 1; }
-tit()  { printf '\n%s%s%s\n' "$BD$M" "$*" "$N"; hr; }
+tit()  { printf '\n%s\n' "$*"; dash; }
 
 # 交互读取：优先 /dev/tty，保证 curl | sudo bash 管道方式下菜单仍可用
 ask() {
@@ -307,10 +307,120 @@ system_info_scan() {
   fi
 }
 
+#------------------------------ 文本排版辅助 ----------------------------------
+str_width() {  # 计算字符串显示宽度（ASCII=1，中文/emoji=2）
+  local s=$1 b c
+  b=${#s}
+  c=$(printf '%s' "$s" | LC_ALL=C.utf8 wc -m 2>/dev/null)
+  [[ -z "$c" ]] && c=$b
+  printf '%d' $(( (b + c) / 2 ))
+}
+
+pad_to() {  # 内容 目标显示宽度
+  local s=$1 target=$2 w pad
+  w=$(str_width "$s")
+  pad=$(( target - w ))
+  (( pad < 0 )) && pad=0
+  printf '%s%*s' "$s" "$pad" ""
+}
+
+dash() { printf '%s\n' "--------------------------------"; }
+
+kv_line() {  # 标签 值 [目标宽度]
+  local k=$1 v=$2 t=${3:-20} pad
+  pad=$(( t - $(str_width "$k:") ))
+  (( pad < 1 )) && pad=1
+  printf '%s%*s%s\n' "$k:" "$pad" "" "$v"
+}
+
+#------------------------------ 指标采集 --------------------------------------
+cpu_usage_pct() {
+  local t1 i1 t2 i2 dt di
+  read -r t1 i1 < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat)
+  sleep 0.3
+  read -r t2 i2 < <(awk '/^cpu /{print $2+$3+$4+$5+$6+$7+$8, $5+$6}' /proc/stat)
+  dt=$(( t2 - t1 )); di=$(( i2 - i1 ))
+  if (( dt > 0 )); then printf '%d' $(( (dt - di) * 100 / dt )); else printf '0'; fi
+}
+
+fmt_bytes() {
+  awk -v b="$1" 'BEGIN{
+    if (b >= 1073741824) printf "%.2fG", b/1073741824;
+    else if (b >= 1048576) printf "%.2fM", b/1048576;
+    else printf "%.0fK", b/1024 }'
+}
+
+mem_stats() {  # 已用M 总量M 百分比
+  awk '/MemTotal/{t=$2} /MemAvailable/{a=$2} END{
+    if (t>0) printf "%.0f %.0f %.0f", (t-a)/1024, t/1024, (t-a)*100/t;
+    else printf "0 0 0" }' /proc/meminfo
+}
+
+swap_stats() {
+  awk '/SwapTotal/{t=$2} /SwapFree/{f=$2} END{
+    if (t>0) printf "%.0f %.0f %.0f", (t-f)/1024, t/1024, (t-f)*100/t;
+    else printf "0 0 0" }' /proc/meminfo
+}
+
+disk_stats() {  # 已用G 总量G 百分比
+  df -B1 --output=used,size / 2>/dev/null | tail -1 | awk '{
+    if ($2>0) printf "%.1f %.1f %.0f", $1/1073741824, $2/1073741824, $1*100/$2;
+    else printf "0 0 0" }'
+}
+
+conn_stats() {  # TCP UDP
+  local t u
+  t=$(( $(wc -l < /proc/net/tcp) - 1 ))
+  u=$(( $(wc -l < /proc/net/udp) - 1 ))
+  (( t < 0 )) && t=0
+  (( u < 0 )) && u=0
+  printf '%d|%d' "$t" "$u"
+}
+
+net_totals() {  # 接收字节 发送字节
+  awk 'NR>2 { rx += $2; tx += $10 } END { printf "%d %d", rx, tx }' /proc/net/dev
+}
+
+net_algo() {
+  local cc qd
+  cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "-")
+  qd=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "-")
+  printf '%s %s' "$cc" "$qd"
+}
+
+ipv4_addr() {
+  local ip
+  ip=$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+  if [[ -z "$ip" ]]; then ip=$(hostname -I 2>/dev/null | awk '{print $1}'); fi
+  printf '%s' "${ip:-未知}"
+}
+
+dns_list() {
+  local d
+  d=$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null)
+  d=${d% }
+  printf '%s' "${d:-无}"
+}
+
+uptime_cn() {
+  awk '{ s=int($1); d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60);
+    if (d>0) printf "%d天 %d时 %d分", d, h, m;
+    else if (h>0) printf "%d时 %d分", h, m;
+    else printf "%d分", m }' /proc/uptime
+}
+
+cpu_freq_ghz() {
+  local m
+  m=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/{gsub(/ /,"",$2); print $2}' | head -1)
+  if [[ -z "$m" ]]; then
+    m=$(awk -F':' '/cpu MHz/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
+  fi
+  if [[ -n "$m" ]]; then awk -v m="$m" 'BEGIN{printf "%.2f GHz", m/1000}'; else printf '未知'; fi
+}
+
 show_system_info() {
   local fmt=${1:-text}
   system_info_scan
-  local d
 
   if [[ "$fmt" == "md" ]]; then
     echo "| 项目 | 内容 |"
@@ -331,59 +441,107 @@ show_system_info() {
     return 0
   fi
 
-  tit "系统与硬件信息"
-  printf '  %-10s %s\n' "主机名" "$SYS_HOST"
-  printf '  %-10s %s\n' "操作系统" "$SYS_OS"
-  printf '  %-10s %s (%s)\n' "内核" "$SYS_KERNEL" "$SYS_ARCH"
-  printf '  %-10s %s · 负载 %s\n' "运行时长" "$SYS_UPTIME" "$SYS_LOAD"
-  printf '  %-10s %s\n' "CPU" "$SYS_CPU"
-  printf '  %-10s %s\n' "内存" "$SYS_MEM"
-  printf '  %-10s %s\n' "显卡" "${SYS_GPU:-未检测到}"
-  if [[ -n "$SYS_MB_MODEL" ]]; then
-    printf '  %-10s %s %s\n' "主板" "$SYS_MB_VENDOR" "$SYS_MB_MODEL"
-  fi
-  if [[ -n "$SYS_BIOS" ]]; then
-    printf '  %-10s %s\n' "BIOS" "$SYS_BIOS"
-  fi
+  local cpu_model cpu_cores cpu_freq cpu_use
+  local mem_u mem_t mem_p sw_u sw_t sw_p dk_u dk_t dk_p
+  local rx tx conn
+  cpu_model=$(awk -F: '/model name/{gsub(/^ +/,"",$2); print $2; exit}' /proc/cpuinfo)
+  cpu_cores=$(nproc 2>/dev/null || echo 1)
+  cpu_freq=$(cpu_freq_ghz)
+  cpu_use=$(cpu_usage_pct)
+  read -r mem_u mem_t mem_p <<<"$(mem_stats)"
+  read -r sw_u sw_t sw_p <<<"$(swap_stats)"
+  read -r dk_u dk_t dk_p <<<"$(disk_stats)"
+  read -r rx tx <<<"$(net_totals)"
+  conn=$(conn_stats)
 
-  printf '\n  %s存储设备%s\n' "$BD" "$N"
-  printf '  %-8s %-28s %-10s %-7s %-6s %s\n' "设备" "型号" "容量" "类型" "总线" "挂载点"
-  hr
+  printf '\n系统信息查询\n'
+  dash
+  kv_line "主机名" "$SYS_HOST"
+  kv_line "系统版本" "$SYS_OS"
+  kv_line "Linux版本" "$SYS_KERNEL"
+  kv_line "系统架构" "$SYS_ARCH"
+  dash
+  kv_line "CPU型号" "${cpu_model:-未知}"
+  kv_line "CPU核心数" "$cpu_cores"
+  kv_line "CPU频率" "$cpu_freq"
+  kv_line "CPU占用" "${cpu_use}%"
+  kv_line "系统负载" "$SYS_LOAD"
+  dash
+  kv_line "TCP|UDP连接数" "$conn"
+  kv_line "物理内存" "${mem_u}M/${mem_t}M (${mem_p}%)"
+  kv_line "虚拟内存" "${sw_u}M/${sw_t}M (${sw_p}%)"
+  kv_line "硬盘占用" "${dk_u}G/${dk_t}G (${dk_p}%)"
+  dash
+  kv_line "总接收" "$(fmt_bytes "$rx")"
+  kv_line "总发送" "$(fmt_bytes "$tx")"
+  dash
+  kv_line "网络算法" "$(net_algo)"
+  dash
+  kv_line "IPv4地址" "$(ipv4_addr)"
+  kv_line "DNS地址" "$(dns_list)"
+  kv_line "系统时间" "$(date +'%Z %Y-%m-%d %H:%M')"
+  dash
+  kv_line "运行时长" "$(uptime_cn)"
+  dash
+  printf '\n'
+
+  printf '硬件信息\n'
+  dash
+  kv_line "显卡" "${SYS_GPU:-未检测到}"
+  if [[ -n "$SYS_MB_MODEL" ]]; then
+    kv_line "主板" "$SYS_MB_VENDOR $SYS_MB_MODEL"
+  else
+    kv_line "主板" "未知"
+  fi
+  kv_line "BIOS" "${SYS_BIOS:-未知}"
+  dash
+  printf '\n'
+
+  printf '存储设备\n'
+  dash
+  printf '%s%s%s%s%s%s\n' \
+    "$(pad_to "设备" 8)" "$(pad_to "型号" 30)" "$(pad_to "容量" 10)" \
+    "$(pad_to "类型" 6)" "$(pad_to "总线" 7)" "挂载点"
+  local d nm sz md rota tran mnt typ
   while IFS= read -r d; do
     [[ -z "$d" ]] && continue
-    local nm sz md rota tran mnt typ
     nm=$(kv NAME "$d"); sz=$(kv SIZE "$d"); md=$(kv MODEL "$d")
     rota=$(kv ROTA "$d"); tran=$(kv TRAN "$d"); mnt=$(kv MOUNTPOINTS "$d")
     case "$nm" in loop*|sr*) continue ;; esac
     [[ "$rota" == "0" ]] && typ="SSD" || typ="HDD"
-    if [[ -z "$mnt" ]]; then mnt="-"; fi
-    printf '  %-8s %-28s %-10s %-7s %-6s %s\n' "$nm" "${md:0:28}" "$sz" "$typ" "${tran:-?}" "$mnt"
+    [[ -z "$mnt" ]] && mnt="-"
+    printf '%s%s%s%s%s%s\n' \
+      "$(pad_to "$nm" 8)" "$(pad_to "${md:0:30}" 30)" "$(pad_to "$sz" 10)" \
+      "$(pad_to "$typ" 6)" "$(pad_to "${tran:-?}" 7)" "$mnt"
   done < <(lsblk -d -P -n -o NAME,SIZE,MODEL,ROTA,TRAN,MOUNTPOINTS 2>/dev/null)
+  dash
+  printf '\n'
 
-  printf '\n  %sPCIe 链路（USB 控制器 / NVMe 桥）%s\n' "$BD" "$N"
+  printf 'PCIe 链路\n'
+  dash
   local rows
   rows=$(pcie_rows)
   if [[ -z "$rows" ]]; then
-    printf '    lspci 不可用或未发现相关设备\n'
+    printf '未发现 USB 控制器或 NVMe 桥（lspci 不可用）\n'
   else
-    printf '  %-12s %-46s %-9s %-7s %s\n' "地址" "设备" "速率" "宽度" "可用带宽"
-    hr
-    local r slot desc sp wd tot
+    printf '%s%s%s%s%s\n' \
+      "$(pad_to "地址" 12)" "$(pad_to "设备" 46)" "$(pad_to "速率" 9)" \
+      "$(pad_to "宽度" 6)" "可用带宽"
+    local slot desc sp wd tot
     while IFS='|' read -r slot desc sp wd tot; do
       [[ -z "$slot" ]] && continue
-      printf '  %-12s %-46s %-9s %-7s %s MB/s\n' "$slot" "$desc" "$sp" "$wd" "$tot"
+      printf '%s%s%s%s%s MB/s\n' \
+        "$(pad_to "$slot" 12)" "$(pad_to "$desc" 46)" "$(pad_to "$sp" 9)" \
+        "$(pad_to "$wd" 6)" "$tot"
       if (( tot > 0 && tot < 1050 )); then
-        printf '               %s└ 该控制器 PCIe 上行仅 %s MB/s，低于单口 10Gbps(1050) —— 插 10Gbps 设备也跑不满%s\n' "$Y" "$tot" "$N"
+        printf '  注意: 该控制器 PCIe 上行仅 %s MB/s，低于单口 10Gbps(1050 MB/s)\n' "$tot"
       fi
     done <<<"$rows"
   fi
-
-  if [[ -n "$SYS_NVME_CTRL" ]]; then
-    printf '\n  %sNVMe 设备%s\n' "$BD" "$N"
-    printf '    %s\n' "$SYS_NVME_CTRL"
-  fi
+  dash
   printf '\n'
 }
+
 
 #------------------------------ sysfs 探测 ------------------------------------
 kv() {
@@ -491,57 +649,99 @@ drv_label() {
 }
 
 list_devices() {
-  printf '\n  %-4s %-7s %-10s %-9s %-7s %-9s %s\n' "#" "设备" "容量" "USB链路" "驱动" "SATA" "型号"
-  hr
+  printf '\n'
+  printf '%s%s%s%s%s%s%s%s\n' \
+    "$(pad_to "序号" 6)" "$(pad_to "设备" 8)" "$(pad_to "型号" 30)" \
+    "$(pad_to "容量" 10)" "$(pad_to "USB链路" 9)" "$(pad_to "驱动" 6)" \
+    "$(pad_to "SATA" 8)" "$(pad_to "选中" 6)"
+  dash
   local i=1 d mark
   for d in "${DEV_LIST[@]:-}"; do
     [[ -z "$d" ]] && continue
-    mark=" "
+    mark="-"
     if [[ " ${SEL[*]:-} " == *" $d "* ]]; then mark="*"; fi
-    printf '  [%d] %s %-7s %-10s %-9s %-7s %-9s %s\n' \
-      "$i" "$mark" "$d" "$(human_size "${D_SIZE[$d]:-0}")" "$(speed_label "${D_SPEED[$d]:-0}")" \
-      "$(drv_label "${D_DRIVER[$d]:-?}")" "${D_SATA[$d]:-未知}" "${D_MODEL[$d]:0:36}"
+    printf '%s%s%s%s%s%s%s%s\n' \
+      "$(pad_to "[$i]" 6)" "$(pad_to "$d" 8)" "$(pad_to "${D_MODEL[$d]:0:30}" 30)" \
+      "$(pad_to "$(human_size "${D_SIZE[$d]:-0}")" 10)" \
+      "$(pad_to "$(speed_label "${D_SPEED[$d]:-0}")" 9)" \
+      "$(pad_to "$(drv_label "${D_DRIVER[$d]:-?}")" 6)" \
+      "$(pad_to "${D_SATA[$d]:-未知}" 8)" \
+      "$(pad_to "$mark" 6)"
     i=$((i+1))
   done
   if [[ ${#DEV_LIST[@]} -eq 0 ]]; then wrn "未发现任何 USB 存储设备"; fi
-  hr
-  printf '  %d 块设备，已选 %d 块\n' "${#DEV_LIST[@]}" "${#SEL[@]}"
+  dash
+  printf '共 %d 块设备，已选 %d 块\n' "${#DEV_LIST[@]}" "${#SEL[@]}"
 }
 
 #------------------------------ 拓扑审计 --------------------------------------
 audit_topology() {
-  tit "一、设备与链路拓扑审计"
-  if [[ ${#DEV_LIST[@]} -eq 0 ]]; then wrn "无设备"; return; fi
-  printf '\n  %-6s %-34s %-10s %-6s %-14s %-8s %-6s %-10s\n' \
-    "设备" "型号" "容量" "USB" "链路世代" "SATA" "驱动" "端口路径"
-  hr
-  local d
+  printf 'USB 拓扑审计\n'
+  dash
+  if [[ ${#DEV_LIST[@]} -eq 0 ]]; then wrn "无 USB 存储设备"; return; fi
+
+  printf '%s%s%s%s%s%s%s%s%s\n' \
+    "$(pad_to "设备" 7)" "$(pad_to "型号" 30)" "$(pad_to "容量" 10)" \
+    "$(pad_to "USB" 7)" "$(pad_to "链路世代" 15)" "$(pad_to "SATA" 9)" \
+    "$(pad_to "驱动" 9)" "$(pad_to "端口" 8)" "UASP"
+  dash
+  local d uasp
   for d in "${DEV_LIST[@]}"; do
-    printf '  %-6s %-34s %-10s %-6s %-14s %-8s %-6s %-10s\n' \
-      "$d" "${D_MODEL[$d]:0:34}" "$(human_size "${D_SIZE[$d]:-0}")" \
-      "${D_USBVER[$d]:-?}" "$(lt "${D_SPEED[$d]:-0}" 1)" \
-      "${D_SATA[$d]:-未知}" "${D_DRIVER[$d]:-?}" "${D_USBPATH[$d]:-?}"
+    uasp="否"
+    [[ "${D_DRIVER[$d]:-}" == "uas" ]] && uasp="是"
+    printf '%s%s%s%s%s%s%s%s%s\n' \
+      "$(pad_to "$d" 7)" "$(pad_to "${D_MODEL[$d]:0:30}" 30)" \
+      "$(pad_to "$(human_size "${D_SIZE[$d]:-0}")" 10)" \
+      "$(pad_to "${D_USBVER[$d]:-?}" 7)" "$(pad_to "$(lt "${D_SPEED[$d]:-0}" 1)" 15)" \
+      "$(pad_to "${D_SATA[$d]:-未知}" 9)" "$(pad_to "${D_DRIVER[$d]:-?}" 9)" \
+      "$(pad_to "${D_USBPATH[$d]:-?}" 8)" "$uasp"
   done
-  hr
+  dash
+  printf '\n'
 
-  printf '\n  USB 控制器与端口树 (lsusb -t)\n'
-  lsusb -t 2>/dev/null | sed 's/^/    /' || wrn "lsusb 不可用"
-  printf '\n  USB 控制器 PCI 设备\n'
-  lspci -nn 2>/dev/null | grep -iE 'usb|xhci' | sed 's/^/    /' || true
+  printf 'USB 控制器与端口树 (lsusb -t)\n'
+  dash
+  local lsub=""
+  if command -v lsusb >/dev/null 2>&1; then
+    lsub=$(lsusb -t 2>/dev/null)
+  fi
+  if [[ -n "$lsub" ]]; then
+    printf '%s\n' "$lsub" | sed 's/^/   /'
+  else
+    printf '   无 USB 总线信息（虚拟机或未启用 USB 控制器）\n'
+  fi
+  printf '\n'
 
-  printf '\n  诊断结论\n'
+  printf 'USB 控制器 PCI 设备\n'
+  dash
+  local lpc=""
+  if command -v lspci >/dev/null 2>&1; then
+    lpc=$(lspci -nn 2>/dev/null | grep -iE 'usb|xhci')
+  fi
+  if [[ -n "$lpc" ]]; then
+    printf '%s\n' "$lpc" | sed 's/^/   /'
+  else
+    printf '   无 USB 控制器\n'
+  fi
+  printf '\n'
+
+  printf '诊断结论\n'
+  dash
+  local sp any=0
   for d in "${DEV_LIST[@]}"; do
-    local sp=${D_SPEED[$d]:-0}
-    if [[ "${D_SPEED[$d]:-0}" -gt 0 && "${D_DRIVER[$d]:-}" != "uas" ]]; then
-      printf '    %-6s [警告] 走 BOT 协议（非 UASP），通常损失 15~30%% 带宽\n' "$d"
+    sp=${D_SPEED[$d]:-0}
+    if [[ "$sp" -gt 0 && "${D_DRIVER[$d]:-}" != "uas" ]]; then
+      printf '   %s: 走 BOT 协议（非 UASP），通常损失 15~30%%%% 带宽\n' "$d"; any=1
     fi
     if [[ "$sp" == "480" ]]; then
-      printf '    %-6s [严重] 插在 USB 2.0 端口！上限仅 43 MB/s —— 换 USB3 口或换线\n' "$d"
+      printf '   %s: 插在 USB 2.0 端口，上限仅 43 MB/s，请换 USB3 口或换线\n' "$d"; any=1
     fi
     if [[ "${D_SATA[$d]:-6.0}" == "6.0" && "$sp" == "10000" ]]; then
-      printf '    %-6s [提示] SATA 6Gbps(约550MB/s) 小于 USB 10Gbps(约1050MB/s)，单盘跑不满链路属正常\n' "$d"
+      printf '   %s: SATA 6Gbps(约550MB/s) 低于 USB 10Gbps(约1050MB/s)，单盘跑不满链路属正常\n' "$d"; any=1
     fi
   done
+  (( any == 0 )) && printf '   未发现明显配置问题\n'
+  dash
   printf '\n'
 }
 
@@ -609,15 +809,12 @@ record() {
 }
 
 show_result() {
-  local bw=${2:-0}
-  printf '    %-24s %10.1f MB/s %8s IOPS %8s us' "$1" "$bw" "${3%.*}" "${4%.*}"
+  local bw=${2:-0} extra=""
+  printf '   %s%10.1f MB/s %8s IOPS %8s us' "$(pad_to "$1" 22)" "$bw" "${3%.*}" "${4%.*}"
   if [[ -n "${5:-}" ]] && (( ${5%.*} > 0 )); then
-    local pct col
+    local pct
     pct=$(awk -v a="$bw" -v b="$5" 'BEGIN{p=a*100/b; if(p>100)p=100; printf "%.0f", p}')
-    col=$R
-    if (( pct >= 85 )); then col=$G; fi
-    if (( pct >= 60 && pct < 85 )); then col=$Y; fi
-    printf '   达成 %s%3s%%%s' "$col" "$pct" "$N"
+    printf '   达成 %3s%%' "$pct"
   fi
   printf '\n'
 }
