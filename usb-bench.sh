@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -57,45 +57,172 @@ AUTO=0
 DEVICE_FILTER=""
 TEST_DIR_OVERRIDE=""
 INCLUDE_NONUSB=0
+SYSINFO_ONLY=0
+NO_SYSINFO=0
+NO_INSTALL=0
 
-#------------------------------ 依赖 ------------------------------------------
+#------------------------------ 依赖与环境 ------------------------------------
 cmds_missing() {
   local c m=()
   for c in "$@"; do command -v "$c" >/dev/null 2>&1 || m+=("$c"); done
   printf '%s' "${m[*]:-}"
 }
 
+detect_pkg_mgr() {
+  local m
+  for m in apt-get dnf yum pacman zypper apk; do
+    if command -v "$m" >/dev/null 2>&1; then
+      case "$m" in
+        apt-get) echo apt ;;
+        yum)     echo dnf ;;
+        *)       echo "$m" ;;
+      esac
+      return 0
+    fi
+  done
+  echo none
+}
+
 pkg_for() {
-  case "$1" in
-    smartctl) echo "smartmontools" ;;
-    lsusb)    echo "usbutils" ;;
-    iostat)   echo "sysstat" ;;
-    *)        echo "$1" ;;
+  local cmd=$1 mgr=$2
+  case "$mgr:$cmd" in
+    apt:smartctl|dnf:smartctl|pacman:smartctl|zypper:smartctl|apk:smartctl) echo smartmontools ;;
+    apt:lsusb|dnf:lsusb|pacman:lsusb|zypper:lsusb|apk:lsusb)                echo usbutils ;;
+    apt:lspci|dnf:lspci|pacman:lspci|zypper:lspci|apk:lspci)                echo pciutils ;;
+    apt:dmidecode|dnf:dmidecode|pacman:dmidecode|zypper:dmidecode|apk:dmidecode) echo dmidecode ;;
+    apt:nvme|dnf:nvme|pacman:nvme|zypper:nvme|apk:nvme)                     echo nvme-cli ;;
+    apt:iostat|dnf:iostat|pacman:iostat|zypper:iostat|apk:iostat)           echo sysstat ;;
+    apt:bc|dnf:bc|pacman:bc|zypper:bc|apk:bc)                              echo bc ;;
+    apt:curl|dnf:curl|pacman:curl|zypper:curl|apk:curl)                     echo curl ;;
+    *)                                                                      echo "$cmd" ;;
   esac
 }
 
+pkg_install() {
+  local mgr=$1; shift
+  case "$mgr" in
+    apt)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq >/dev/null 2>&1
+      apt-get install -y -qq "$@" >/dev/null 2>&1
+      ;;
+    dnf)    dnf install -y -q "$@" >/dev/null 2>&1 ;;
+    pacman) pacman -Sy --noconfirm --needed "$@" >/dev/null 2>&1 ;;
+    zypper) zypper -n install -y "$@" >/dev/null 2>&1 ;;
+    apk)    apk add --no-cache "$@" >/dev/null 2>&1 ;;
+    *)      return 1 ;;
+  esac
+}
+
+DEP_REQUIRED="fio jq awk sed grep lsblk"
+DEP_OPTIONAL="smartctl lsusb lspci dmidecode hdparm nvme"
+
 ensure_deps() {
-  local need req=() p
-  need=$(cmds_missing fio jq lsblk lsusb smartctl awk sed)
-  if [[ -z "$need" ]]; then ok "依赖齐全 (fio / jq / smartctl / lsusb)"; return 0; fi
-  for p in $need; do req+=("$(pkg_for "$p")"); done
-  wrn "缺少: $need   ->   apt 安装: ${req[*]}"
-  if ! command -v apt-get >/dev/null 2>&1; then
-    err "非 apt 系统，请手动安装 fio / jq / smartmontools 后重试"; return 1
+  local mgr miss_req miss_opt pkgs=() c seen=" " p rc=0
+  mgr=$(detect_pkg_mgr)
+  miss_req=$(cmds_missing $DEP_REQUIRED)
+  miss_opt=$(cmds_missing $DEP_OPTIONAL)
+
+  if [[ -z "$miss_req" && -z "$miss_opt" ]]; then
+    ok "依赖齐全，无需安装"
+    return 0
   fi
-  inf "正在安装（首次可能耗时 1-2 分钟）..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt-get update -qq >/dev/null 2>&1
-  if apt-get install -y -qq "${req[@]}" >/dev/null 2>&1; then
-    ok "依赖安装完成"
+
+  if [[ -n "$miss_req" ]]; then wrn "缺少必需组件: $miss_req"; fi
+  if [[ -n "$miss_opt" ]]; then inf "缺少可选组件: $miss_opt（将尝试补装，失败则降级运行）"; fi
+
+  if [[ "$mgr" == "none" ]]; then
+    if [[ -n "$miss_req" ]]; then
+      err "未识别包管理器，且缺少必需组件: $miss_req"
+      err "请手动安装 fio 与 jq 后重试"
+      return 1
+    fi
+    wrn "未识别包管理器，跳过可选组件安装，继续运行"
+    return 0
+  fi
+
+  inf "自动安装依赖中（包管理器: $mgr），首次可能需要 1-2 分钟…"
+  for c in $miss_req $miss_opt; do
+    p=$(pkg_for "$c" "$mgr")
+    if [[ "$seen" != *" $p "* ]]; then seen="$seen$p "; pkgs+=("$p"); fi
+  done
+
+  if (( ${#pkgs[@]} > 0 )); then
+    pkg_install "$mgr" "${pkgs[@]}" || wrn "安装命令返回非零（部分包可能已失败）"
+  fi
+
+  miss_req=$(cmds_missing $DEP_REQUIRED)
+  if [[ -n "$miss_req" ]]; then
+    err "必需组件仍未就绪: $miss_req"
+    err "请手动安装后重试："
+    case "$mgr" in
+      apt)    err "  sudo apt update && sudo apt install -y fio jq" ;;
+      dnf)    err "  sudo dnf install -y fio jq" ;;
+      pacman) err "  sudo pacman -S fio jq" ;;
+      zypper) err "  sudo zypper install -y fio jq" ;;
+      apk)    err "  sudo apk add fio jq" ;;
+    esac
+    rc=1
   else
-    err "安装失败，请检查网络/软件源（可先执行 apt-get update）"
-    return 1
+    ok "必需组件就绪"
   fi
-  need=$(cmds_missing fio jq)
-  if [[ -n "$need" ]]; then err "仍缺少关键命令: $need"; return 1; fi
+
+  miss_opt=$(cmds_missing $DEP_OPTIONAL)
+  if [[ -n "$miss_opt" ]]; then
+    wrn "以下可选组件缺失，相关功能将降级: $miss_opt"
+  else
+    ok "可选组件就绪"
+  fi
+  return $rc
+}
+
+env_selfcheck() {
+  tit "环境自检"
+  local mgr kver eng
+  mgr=$(detect_pkg_mgr)
+  kver=$(uname -r)
+  eng="$IOENGINE"
+
+  printf '  %-18s %s\n' "包管理器" "$mgr"
+  printf '  %-18s %s\n' "内核版本" "$kver"
+  if [[ $EUID -eq 0 ]]; then
+    printf '  %-18s %s\n' "运行身份" "root（完整功能）"
+  else
+    printf '  %-18s %s\n' "运行身份" "普通用户（smartctl/挂载受限）"
+  fi
+  printf '  %-18s %s\n' "I/O 引擎" "$eng"
+
+  printf '\n  %-14s %-8s %s\n' "组件" "状态" "版本/说明"
+  hr
+  local c v
+  for c in fio jq smartctl lsusb lspci dmidecode hdparm nvme; do
+    if command -v "$c" >/dev/null 2>&1; then
+      case "$c" in
+        fio) v=$(fio --version 2>/dev/null) ;;
+        jq)  v=$(jq --version 2>/dev/null) ;;
+        *)   v=$(command -v "$c") ;;
+      esac
+      printf '  %-14s %s%-6s%s %s\n' "$c" "$G" "OK" "$N" "$v"
+    else
+      printf '  %-14s %s%-6s%s 未安装（功能降级）\n' "$c" "$Y" "MISS" "$N"
+    fi
+  done
+  hr
+
+  if fio --enghelp 2>/dev/null | grep -qw io_uring; then
+    ok "io_uring 可用"
+  else
+    wrn "io_uring 不可用，将回退 libaio"
+  fi
+  if dd if=/dev/zero of=/tmp/.ub_probe bs=1M count=4 oflag=direct 2>/dev/null; then
+    ok "O_DIRECT 可用（能绕过页缓存做准确测试）"
+  else
+    wrn "O_DIRECT 探针失败，测试可能受页缓存影响"
+  fi
+  rm -f /tmp/.ub_probe 2>/dev/null
   return 0
 }
+
 
 #------------------------------ 链路理论值 ------------------------------------
 link_theory() {
@@ -115,6 +242,179 @@ sata_ref() {
   case "$1" in
     6.0) echo 550 ;; 3.0) echo 270 ;; 1.5) echo 130 ;; *) echo 550 ;;
   esac
+}
+
+#------------------------------ 系统与硬件信息 --------------------------------
+pcie_lane_mbps() {
+  case "$1" in
+    2.5GT/s) echo 250 ;; 5GT/s) echo 500 ;; 8GT/s) echo 985 ;;
+    16GT/s)  echo 1969 ;; 32GT/s) echo 3938 ;; 64GT/s) echo 7877 ;;
+    *)       echo 0 ;;
+  esac
+}
+
+gpu_summary() {
+  local out=""
+  if command -v nvidia-smi >/dev/null 2>&1; then
+    out=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -4 | paste -sd '; ' -)
+  fi
+  if [[ -z "$out" ]] && command -v lspci >/dev/null 2>&1; then
+    out=$(lspci 2>/dev/null | grep -E 'VGA compatible|3D controller|Display controller' | sed 's/^[0-9a-fA-F:.]* //' | paste -sd '; ' -)
+  fi
+  printf '%s' "$out"
+}
+
+mem_summary() {
+  local total used avail swap cnt speed
+  total=$(awk '/MemTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)
+  used=$(free -m | awk '/^Mem:/{printf "%.1f", $3/1024}')
+  avail=$(awk '/MemAvailable/{printf "%.1f", $2/1048576}' /proc/meminfo)
+  swap=$(awk '/SwapTotal/{printf "%.1f", $2/1048576}' /proc/meminfo)
+  printf '共 %s GB · 已用 %s GB · 可用 %s GB · Swap %s GB' "$total" "$used" "$avail" "$swap"
+
+  if command -v dmidecode >/dev/null 2>&1; then
+    cnt=$(dmidecode -t 17 2>/dev/null | grep -c '^[[:space:]]*Size:.*[0-9]')
+    speed=$(dmidecode -t 17 2>/dev/null | grep -m1 '^[[:space:]]*Speed:' | sed 's/.*: *//')
+    if [[ "$cnt" -gt 0 ]]; then
+      printf ' · %s 条内存' "$cnt"
+      if [[ -n "$speed" && "$speed" != "Unknown" ]]; then printf ' @ %s' "$speed"; fi
+    fi
+  fi
+}
+
+cpu_summary() {
+  local model threads cores maxmhz
+  model=$(awk -F: '/model name/{gsub(/^ +/,"",$2);print $2;exit}' /proc/cpuinfo)
+  threads=$(nproc 2>/dev/null || grep -c ^processor /proc/cpuinfo)
+  cores=$(lscpu 2>/dev/null | awk -F: '/Core\(s\) per socket/{gsub(/ /,"",$2);print $2}' | head -1)
+  maxmhz=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/{gsub(/ /,"",$2);print $2}' | head -1)
+  local sock
+  sock=$(lscpu 2>/dev/null | awk -F: '/^Socket\(s\)/{gsub(/ /,"",$2);print $2}' | head -1)
+  printf '%s' "$model"
+  printf ' · %s 线程' "$threads"
+  if [[ -n "$sock" && "$sock" != "1" ]]; then printf ' · %s 路 × %s 核' "$sock" "${cores:-?}"; fi
+  if [[ -n "$maxmhz" ]]; then printf ' · 最高 %s MHz' "$(printf '%.0f' "$maxmhz")"; fi
+}
+
+pcie_rows() {  # 输出 slot|desc|speed|width|totalMBs
+  command -v lspci >/dev/null 2>&1 || return 1
+  local line slot desc info sp wd lane tot
+  while IFS= read -r line; do
+    slot=${line%% *}
+    desc=${line#* }
+    info=$(lspci -vv -s "$slot" 2>/dev/null)
+    sp=$(grep -m1 'LnkSta:' <<<"$info" | grep -oE '[0-9.]+GT/s' | head -1)
+    wd=$(grep -m1 'LnkSta:' <<<"$info" | grep -oE 'Width x[0-9]+' | head -1 | grep -oE '[0-9]+$')
+    [[ -z "$sp" ]] && continue
+    lane=$(pcie_lane_mbps "$sp")
+    tot=$(( lane * ${wd:-1} ))
+    printf '%s|%s|%s|x%s|%s\n' "$slot" "${desc:0:46}" "$sp" "${wd:-?}" "$tot"
+  done < <(lspci 2>/dev/null | grep -iE 'usb controller|non-volatile memory')
+}
+
+system_info_scan() {
+  SYS_OS=$( (. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME") || echo Linux )
+  SYS_KERNEL=$(uname -r)
+  SYS_ARCH=$(uname -m)
+  SYS_HOST=$(hostname)
+  SYS_UPTIME=$(awk '{s=int($1); d=int(s/86400); h=int((s%86400)/3600); m=int((s%3600)/60);
+      if(d>0) printf "%d 天 %d 小时", d, h; else if(h>0) printf "%d 小时 %d 分", h, m; else printf "%d 分", m}' /proc/uptime 2>/dev/null || echo "?")
+  SYS_LOAD=$(awk '{print $1", "$2", "$3}' /proc/loadavg)
+  SYS_CPU=$(cpu_summary)
+  SYS_MEM=$(mem_summary)
+  SYS_GPU=$(gpu_summary)
+  SYS_MB_VENDOR=""; SYS_MB_MODEL=""; SYS_BIOS=""
+  if command -v dmidecode >/dev/null 2>&1; then
+    SYS_MB_VENDOR=$(dmidecode -s baseboard-manufacturer 2>/dev/null || true)
+    SYS_MB_MODEL=$(dmidecode -s baseboard-product-name 2>/dev/null || true)
+    SYS_BIOS=$(dmidecode -s bios-version 2>/dev/null || true)
+    local bd
+    bd=$(dmidecode -s bios-release-date 2>/dev/null || true)
+    [[ -n "$bd" ]] && SYS_BIOS="$SYS_BIOS ($bd)"
+  fi
+  SYS_PCIE=$(pcie_rows)
+  SYS_NVME_CTRL=""
+  if command -v nvme >/dev/null 2>&1; then
+    SYS_NVME_CTRL=$(nvme list 2>/dev/null | tail -n +3 | awk '{printf "%s %s %s; ", $1, $2, $3}' || true)
+  fi
+}
+
+show_system_info() {
+  local fmt=${1:-text}
+  system_info_scan
+  local d
+
+  if [[ "$fmt" == "md" ]]; then
+    echo "| 项目 | 内容 |"
+    echo "|---|---|"
+    echo "| 主机名 | $(md_escape "$SYS_HOST") |"
+    echo "| 操作系统 | $(md_escape "$SYS_OS") |"
+    echo "| 内核 | $SYS_KERNEL ($SYS_ARCH) |"
+    echo "| 运行时长 | $SYS_UPTIME · 负载 $SYS_LOAD |"
+    echo "| CPU | $(md_escape "$SYS_CPU") |"
+    echo "| 内存 | $(md_escape "$SYS_MEM") |"
+    echo "| 显卡 | $(md_escape "${SYS_GPU:-未检测到独立/集成显卡}") |"
+    if [[ -n "$SYS_MB_MODEL" ]]; then
+      echo "| 主板 | $(md_escape "$SYS_MB_VENDOR $SYS_MB_MODEL") |"
+    fi
+    if [[ -n "$SYS_BIOS" ]]; then
+      echo "| BIOS | $(md_escape "$SYS_BIOS") |"
+    fi
+    return 0
+  fi
+
+  tit "系统与硬件信息"
+  printf '  %-10s %s\n' "主机名" "$SYS_HOST"
+  printf '  %-10s %s\n' "操作系统" "$SYS_OS"
+  printf '  %-10s %s (%s)\n' "内核" "$SYS_KERNEL" "$SYS_ARCH"
+  printf '  %-10s %s · 负载 %s\n' "运行时长" "$SYS_UPTIME" "$SYS_LOAD"
+  printf '  %-10s %s\n' "CPU" "$SYS_CPU"
+  printf '  %-10s %s\n' "内存" "$SYS_MEM"
+  printf '  %-10s %s\n' "显卡" "${SYS_GPU:-未检测到}"
+  if [[ -n "$SYS_MB_MODEL" ]]; then
+    printf '  %-10s %s %s\n' "主板" "$SYS_MB_VENDOR" "$SYS_MB_MODEL"
+  fi
+  if [[ -n "$SYS_BIOS" ]]; then
+    printf '  %-10s %s\n' "BIOS" "$SYS_BIOS"
+  fi
+
+  printf '\n  %s存储设备%s\n' "$BD" "$N"
+  printf '  %-8s %-28s %-10s %-7s %-6s %s\n' "设备" "型号" "容量" "类型" "总线" "挂载点"
+  hr
+  while IFS= read -r d; do
+    [[ -z "$d" ]] && continue
+    local nm sz md rota tran mnt typ
+    nm=$(kv NAME "$d"); sz=$(kv SIZE "$d"); md=$(kv MODEL "$d")
+    rota=$(kv ROTA "$d"); tran=$(kv TRAN "$d"); mnt=$(kv MOUNTPOINTS "$d")
+    case "$nm" in loop*|sr*) continue ;; esac
+    [[ "$rota" == "0" ]] && typ="SSD" || typ="HDD"
+    if [[ -z "$mnt" ]]; then mnt="-"; fi
+    printf '  %-8s %-28s %-10s %-7s %-6s %s\n' "$nm" "${md:0:28}" "$sz" "$typ" "${tran:-?}" "$mnt"
+  done < <(lsblk -d -P -n -o NAME,SIZE,MODEL,ROTA,TRAN,MOUNTPOINTS 2>/dev/null)
+
+  printf '\n  %sPCIe 链路（USB 控制器 / NVMe 桥）%s\n' "$BD" "$N"
+  local rows
+  rows=$(pcie_rows)
+  if [[ -z "$rows" ]]; then
+    printf '    lspci 不可用或未发现相关设备\n'
+  else
+    printf '  %-12s %-46s %-9s %-7s %s\n' "地址" "设备" "速率" "宽度" "可用带宽"
+    hr
+    local r slot desc sp wd tot
+    while IFS='|' read -r slot desc sp wd tot; do
+      [[ -z "$slot" ]] && continue
+      printf '  %-12s %-46s %-9s %-7s %s MB/s\n' "$slot" "$desc" "$sp" "$wd" "$tot"
+      if (( tot > 0 && tot < 1050 )); then
+        printf '               %s└ 该控制器 PCIe 上行仅 %s MB/s，低于单口 10Gbps(1050) —— 插 10Gbps 设备也跑不满%s\n' "$Y" "$tot" "$N"
+      fi
+    done <<<"$rows"
+  fi
+
+  if [[ -n "$SYS_NVME_CTRL" ]]; then
+    printf '\n  %sNVMe 设备%s\n' "$BD" "$N"
+    printf '    %s\n' "$SYS_NVME_CTRL"
+  fi
+  printf '\n'
 }
 
 #------------------------------ sysfs 探测 ------------------------------------
@@ -499,7 +799,19 @@ bench_multi() {
 }
 
 #------------------------------ 报告 ------------------------------------------
-md_escape() { printf '%s' "${1//|/|}"; }
+csv_escape() {
+  local v="${1:-}"
+  v="${v//\"/\"\"}"
+  printf '"%s"' "$v"
+}
+
+md_escape() {
+  local v="${1:-}"
+  v="${v//|/\\|}"
+  v="${v//$'\n'/ }"
+  v="${v//$'\r'/}"
+  printf '%s' "$v"
+}
 
 analyze_bottleneck() {
   local d bw_read ref4 sata_r lim pct verdict
@@ -556,7 +868,11 @@ gen_report() {
     echo "| 随机测试时长 | ${RUNTIME} s |"
     echo "| 写入测试 | $([[ $DO_WRITE -eq 1 ]] && echo 启用 || echo 仅读) |"
     echo
-    echo "## 一、设备与链路拓扑"
+    echo "## 一、系统与硬件信息"
+    echo
+    show_system_info md
+    echo
+    echo "## 二、设备与链路拓扑"
     echo
     echo "| 设备 | 型号 | 容量 | USB 版本 | 链路世代 | SATA 协商 | 驱动 | 端口路径 |"
     echo "|---|---|---|---|---|---|---|---|"
@@ -575,7 +891,7 @@ gen_report() {
     echo "| USB 3.2 Gen2x2 | 20 Gbps | 2500 MB/s | 2000 MB/s |"
     echo "| SATA III | 6 Gbps | 750 MB/s | 550 MB/s |"
     echo
-    echo "## 二、单盘性能"
+    echo "## 三、单盘性能"
     for d in "${SEL[@]:-}"; do
       [[ -z "$d" ]] && continue
       [[ -f "$OUT_DIR/raw/${d}_seq_read.json" ]] || continue
@@ -604,7 +920,7 @@ gen_report() {
       fi
     done
     echo
-    echo "## 三、多盘并发总带宽"
+    echo "## 四、多盘并发总带宽"
     echo
     echo "| 场景 | 总带宽 (MB/s) | 总 IOPS |"
     echo "|---|---:|---:|"
@@ -617,11 +933,11 @@ gen_report() {
       echo "| （未执行多盘并发测试） | — | — |"
     fi
     echo
-    echo "## 四、瓶颈分析"
+    echo "## 五、瓶颈分析"
     echo
     analyze_bottleneck
     echo
-    echo "## 五、原始数据"
+    echo "## 六、原始数据"
     echo
     printf '\140\140\140\n'
     echo "结果目录: $OUT_DIR"
@@ -638,7 +954,7 @@ gen_report() {
       if [[ "$dv" != "ALL" ]]; then
         sp=${D_SPEED[$dv]:-0}; drv=${D_DRIVER[$dv]:-?}; sata=${D_SATA[$dv]:-?}
       fi
-      echo "$dv,$(md_escape "${D_MODEL[$dv]:-ALL}"),$sp,$drv,$sata,$t,${R_BW[$k]:-0},${R_IOPS[$k]:-0},${R_LAT[$k]:-0}"
+      echo "$dv,$(csv_escape "${D_MODEL[$dv]:-ALL}"),$sp,$drv,$sata,$t,${R_BW[$k]:-0},${R_IOPS[$k]:-0},${R_LAT[$k]:-0}"
     done
   } > "$OUT_DIR/结果.csv"
 
@@ -693,6 +1009,8 @@ start_run() {
     echo; echo "=== lsusb -t ==="; lsusb -t 2>/dev/null
     echo; echo "=== lspci usb ==="; lspci -nn 2>/dev/null | grep -iE 'usb|xhci'
     echo; echo "=== uname ==="; uname -a
+    echo; echo "=== 系统信息 ==="
+    show_system_info text
   } > "$OUT_DIR/topology.txt" 2>&1
 
   local d
@@ -808,40 +1126,80 @@ show_results_dir() {
   fi
 }
 
+
+#------------------------------ 菜单 ------------------------------------------
+pick_preset() {
+  hr2
+  printf '   选择测试档位\n'
+  hr2
+  echo "     1) 快速   8GB  / 10s   约 1 分钟/盘"
+  echo "     2) 标准   16GB / 30s   约 4 分钟/盘   ★推荐"
+  echo "     3) 极限   32GB / 60s   约 10 分钟/盘"
+  echo "     0) 返回"
+  echo
+  printf '   请选择: '
+  local c; read -r c
+  case "$c" in
+    1) QUICK=1; FULL=0; FILE_GB=8;  RUNTIME=10; return 0 ;;
+    2) QUICK=0; FULL=0; FILE_GB=16; RUNTIME=30; return 0 ;;
+    3) QUICK=0; FULL=1; FILE_GB=32; RUNTIME=60; return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+run_everything() {
+  show_system_info text
+  enumerate_devices
+  audit_topology
+  run_suite
+}
+
 main_menu() {
   while true; do
     clear 2>/dev/null || true
     hr2
     printf '   USB / UASP 外置存储 · 链路极限速率一键测试   v%s\n' "$VERSION"
     hr2
-    printf '   主机: %-22s 内核: %s\n' "$(hostname)" "$(uname -r)"
-    printf '   已识别 USB 存储: %d 块    已选择: %d 块\n' "${#DEV_LIST[@]}" "${#SEL[@]}"
-    printf '   参数: 文件 %sGB · 随机 %ss · 写入 %s · 引擎 %s\n' \
+    printf '   主机  %-22s 内核  %s\n' "$(hostname)" "$(uname -r)"
+    printf '   设备  已识别 %d 块 · 已选择 %d 块\n' "${#DEV_LIST[@]}" "${#SEL[@]}"
+    printf '   参数  %sGB 文件 · %ss 随机 · 写入%s · 引擎 %s\n' \
       "$FILE_GB" "$RUNTIME" "$([[ $DO_WRITE -eq 1 ]] && echo 开 || echo 关)" "$IOENGINE"
     hr2
     echo
-    echo "     1) 拓扑审计   —— 链路 / 驱动 / 端口 / 是否降速"
-    echo "     2) 快速测试   —— 每盘约 1 分钟（8GB  / 10s）"
-    echo "     3) 标准测试   —— 每盘约 4 分钟（16GB / 30s）  推荐"
-    echo "     4) 极限测试   —— 每盘约 10 分钟（32GB / 60s）"
-    echo "     5) 多盘并发   —— 只测链路共享总带宽"
-    echo "     6) 选择测试设备"
-    echo "     7) 自定义参数"
-    echo "     8) 查看历史报告"
-    echo "     9) 检查/安装依赖"
-    echo "     0) 退出"
+    echo "    快速开始 ────────────────────────────────────────────"
+    echo "      1) 一键全流程   系统信息 + 拓扑审计 + 全部测试 + 报告   ★推荐"
+    echo "      2) 快速体检     系统信息 + 拓扑 + 轻量测试（约 1 分钟/盘）"
     echo
-    printf '   请选择: '; local c; read -r c
+    echo "    单项功能 ────────────────────────────────────────────"
+    echo "      3) 系统与硬件信息   CPU / 内存 / 显卡 / 磁盘 / PCIe 链路"
+    echo "      4) USB 拓扑审计     链路速率 / UASP / SATA 协商 / 端口"
+    echo "      5) 性能测试         选档位后跑全项目"
+    echo "      6) 多盘并发         链路共享总带宽"
+    echo
+    echo "    配置与查看 ──────────────────────────────────────────"
+    echo "      7) 选择测试设备"
+    echo "      8) 参数设置"
+    echo "      9) 历史报告"
+    echo "     10) 环境自检与修复"
+    echo "      0) 退出"
+    echo
+    printf '   请选择: '
+    local c; read -r c
     case "$c" in
-      1) enumerate_devices; audit_topology; printf '   回车继续...'; read -r _ ;;
-      2) QUICK=1; FULL=0; FILE_GB=8;  RUNTIME=10; pick_engine; run_suite; printf '   回车继续...'; read -r _ ;;
-      3) QUICK=0; FULL=0; FILE_GB=16; RUNTIME=30; pick_engine; run_suite; printf '   回车继续...'; read -r _ ;;
-      4) QUICK=0; FULL=1; FILE_GB=32; RUNTIME=60; pick_engine; run_suite; printf '   回车继续...'; read -r _ ;;
-      5) pick_engine; start_run; bench_multi read; gen_report; cleanup_mounts; printf '   回车继续...'; read -r _ ;;
-      6) choose_devices ;;
-      7) set_params ;;
-      8) show_results_dir ;;
-      9) ensure_deps; printf '   回车继续...'; read -r _ ;;
+      1) pick_preset || continue; pick_engine; run_everything; printf '\n   回车继续...'; read -r _ ;;
+      2) QUICK=1; FULL=0; FILE_GB=8; RUNTIME=10; pick_engine
+         show_system_info text; enumerate_devices; audit_topology; run_suite
+         printf '\n   回车继续...'; read -r _ ;;
+      3) enumerate_devices; show_system_info text; printf '   回车继续...'; read -r _ ;;
+      4) enumerate_devices; audit_topology; printf '   回车继续...'; read -r _ ;;
+      5) pick_preset || continue; pick_engine; enumerate_devices; run_suite
+         printf '\n   回车继续...'; read -r _ ;;
+      6) pick_engine; enumerate_devices; start_run; bench_multi read; gen_report; cleanup_mounts
+         printf '\n   回车继续...'; read -r _ ;;
+      7) choose_devices ;;
+      8) set_params ;;
+      9) show_results_dir ;;
+      10) ensure_deps; env_selfcheck; printf '   回车继续...'; read -r _ ;;
       0) printf '\n   再见。\n\n'; exit 0 ;;
       *) ;;
     esac
@@ -854,12 +1212,14 @@ usage() {
 usb-bench.sh v$VERSION — USB 外置存储链路极限速率一键测试
 
 用法:
-  sudo $0                交互菜单
-  sudo $0 --auto [选项]  全自动（拓扑审计 + 标准测试 + 报告）
-  sudo $0 -h             本帮助
+  sudo $0                 交互菜单
+  sudo $0 --auto [选项]   全自动（系统信息 + 拓扑 + 测试 + 报告）
+  sudo $0 --sysinfo       只看系统与硬件信息
+  sudo $0 -h              本帮助
 
 选项:
   --auto              无需交互直接跑完全流程
+  --sysinfo           打印系统与硬件信息后退出
   --quick             快速: 8GB 文件 / 10s 随机
   --full              极限: 32GB 文件 / 60s 随机
   --size N            自定义测试文件 GB (2-64)
@@ -870,20 +1230,23 @@ usb-bench.sh v$VERSION — USB 外置存储链路极限速率一键测试
   --engine NAME       libaio / io_uring / psync
   --no-mount          不自动挂载未挂载的盘
   --include-nonusb    同时列出内置 SATA/NVMe 盘（做基线对比用）
+  --no-sysinfo        自动模式跳过系统信息打印
+  --no-install        缺少依赖时不自动安装，直接退出
 
 示例:
   sudo $0 --auto --devices sdb,sdc --read-only
   sudo $0 --auto --full --size 32 --runtime 60
+  sudo $0 --sysinfo
 EOF
 }
 
 main() {
   if [[ "$EUID" -ne 0 ]]; then
     if command -v sudo >/dev/null 2>&1; then
-      printf '需要 root 权限（smartctl / mount / 块设备），正在提权...\n'
+      printf '需要 root 权限（smartctl / 挂载 / 直连块设备），正在提权...\n'
       exec sudo -E bash "$SELF" "$@"
     else
-      printf '警告: 非 root 运行，smartctl 与自动挂载不可用\n'
+      printf '警告: 非 root 运行，smartctl 与自动挂载将不可用\n'
     fi
   fi
   mkdir -p "$BASE_DIR" "$MOUNT_ROOT" "$OUT_ROOT"
@@ -892,11 +1255,27 @@ main() {
   hr2
   printf '   USB / UASP 外置存储 · 链路极限速率一键测试   v%s\n' "$VERSION"
   hr2
-  if ! ensure_deps; then printf '\n  依赖不满足，回车退出...'; read -r _; exit 1; fi
+
+  if [[ "$NO_INSTALL" -eq 1 && -n "$(cmds_missing $DEP_REQUIRED)" ]]; then
+    err "缺少必需组件且已指定 --no-install: $(cmds_missing $DEP_REQUIRED)"
+    exit 1
+  fi
+  if ! ensure_deps; then
+    printf '\n  依赖不满足，无法继续。按回车退出...'
+    read -r _ || true
+    exit 1
+  fi
+
   pick_engine
   enumerate_devices
 
+  if [[ "$SYSINFO_ONLY" -eq 1 ]]; then
+    show_system_info text
+    exit 0
+  fi
+
   if [[ "$AUTO" -eq 1 ]]; then
+    if [[ "$NO_SYSINFO" -ne 1 ]]; then show_system_info text; fi
     audit_topology
     run_suite
     exit 0
@@ -908,17 +1287,20 @@ trap 'cleanup_mounts' EXIT INT TERM
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -h|--help) usage; exit 0 ;;
-    --auto) AUTO=1 ;;
-    --quick) QUICK=1; FILE_GB=8; RUNTIME=10 ;;
-    --full) FULL=1; FILE_GB=32; RUNTIME=60 ;;
-    --size) shift; FILE_GB=${1:-16} ;;
-    --runtime) shift; RUNTIME=${1:-30} ;;
-    --read-only) DO_WRITE=0 ;;
-    --devices) shift; DEVICE_FILTER=$(tr ',' ' ' <<<"${1:-}") ;;
-    --dir) shift; TEST_DIR_OVERRIDE=${1:-} ;;
-    --engine) shift; IOENGINE=${1:-libaio} ;;
-    --no-mount) AUTO_MOUNT=0 ;;
+    -h|--help)     usage; exit 0 ;;
+    --auto)        AUTO=1 ;;
+    --sysinfo)     SYSINFO_ONLY=1 ;;
+    --no-sysinfo)  NO_SYSINFO=1 ;;
+    --no-install)  NO_INSTALL=1 ;;
+    --quick)       QUICK=1; FILE_GB=8; RUNTIME=10 ;;
+    --full)        FULL=1; FILE_GB=32; RUNTIME=60 ;;
+    --size)        shift; FILE_GB=${1:-16} ;;
+    --runtime)     shift; RUNTIME=${1:-30} ;;
+    --read-only)   DO_WRITE=0 ;;
+    --devices)     shift; DEVICE_FILTER=$(tr ',' ' ' <<<"${1:-}") ;;
+    --dir)         shift; TEST_DIR_OVERRIDE=${1:-} ;;
+    --engine)      shift; IOENGINE=${1:-libaio} ;;
+    --no-mount)    AUTO_MOUNT=0 ;;
     --include-nonusb) INCLUDE_NONUSB=1 ;;
     *) ;;
   esac
