@@ -1,0 +1,11 @@
+# 测试产物
+*.log
+raw/
+结果.*
+报告.md
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+.DS_Store
