@@ -19,9 +19,9 @@ die()  { printf '[FAIL] %s\n' "$*" >&2; exit 1; }
 
 fetch() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 10 --max-time 60 "$1" 2>/dev/null
+    curl -fsSL --connect-timeout 5 --max-time 15 "$1" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout=60 "$1" 2>/dev/null
+    wget -qO- --timeout=15 --tries=1 "$1" 2>/dev/null
   else
     return 127
   fi
@@ -61,7 +61,7 @@ for u in "${SOURCES[@]}"; do
       printf '       内容不是脚本（可能被网络劫持），跳过\n'
     fi
   else
-    printf '       下载失败，跳过\n'
+    printf '       下载失败或超时，跳过\n'
   fi
 done
 
@@ -82,9 +82,17 @@ printf '[ OK ] 选用 %s（v%s）\n' "$GOT" "$BEST_VER"
 
 if install -m 755 "$BEST" "$TARGET" 2>/dev/null \
    || { command -v sudo >/dev/null 2>&1 && sudo install -m 755 "$BEST" "$TARGET" 2>/dev/null; }; then
-  printf '[ OK ] 已安装到 %s\n\n' "$TARGET"
+  # 校验真正落盘的版本，避免"装了个旧的"
+  INSTALLED=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$TARGET" 2>/dev/null | head -1)
+  if [[ "$INSTALLED" != "$BEST_VER" ]]; then
+    warn "安装后版本校验不符（期望 $BEST_VER，实际 ${INSTALLED:-未知}），改为直接运行下载的文件"
+    TARGET="$BEST"
+    chmod 755 "$TARGET" 2>/dev/null
+  else
+    printf '[ OK ] 已安装到 %s（v%s）\n\n' "$TARGET" "$INSTALLED"
+  fi
 else
-  warn "无法写入 $TARGET，改为直接运行临时文件"
+  warn "无法写入 $TARGET，改为直接运行下载的文件"
   TARGET="$BEST"
   chmod 755 "$TARGET" 2>/dev/null
 fi

@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.5.0"
+VERSION="1.5.1"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -32,17 +32,40 @@ die()  { err "$*"; exit 1; }
 tit()  { printf '\n%s\n' "$*"; dash; }
 
 # 交互读取：优先 /dev/tty，保证 curl | sudo bash 管道方式下菜单仍可用
+# 读取一行到全局 REPLY。返回 1 表示 EOF。
+# 刻意不使用 $(ask)：命令替换会开子 shell，bash 必须等子 shell 结束才处理
+# SIGINT，导致菜单卡住时 Ctrl+C 无效。
 ask() {
-  local __a=""
-  # 有控制终端就用 /dev/tty（管道执行时菜单仍可交互）；
-  # 无控制终端（CI/无 tty 的 ssh）自动回退到 stdin，避免阻塞。
+  local __a="" rc=1
+  REPLY=""
   if { exec 3<>/dev/tty; } 2>/dev/null; then
-    IFS= read -r __a <&3 || __a=""
+    IFS= read -r __a <&3
+    rc=$?
     exec 3<&- 2>/dev/null
-  else
-    IFS= read -r __a || __a=""
   fi
-  printf '%s' "$__a"
+  if (( rc != 0 )); then
+    IFS= read -r __a
+    rc=$?
+  fi
+  REPLY="$__a"
+  (( rc != 0 )) && return 1
+  return 0
+}
+
+# 读入到指定变量，EOF 直接退出；连续空输入也退出，避免死循环
+EMPTY_HITS=0
+readinto() {
+  ask || { printf '\n'; exit 0; }
+  if [[ -z "$REPLY" ]]; then
+    EMPTY_HITS=$((EMPTY_HITS + 1))
+    if (( EMPTY_HITS >= 5 )); then
+      printf '\n输入异常（连续空行），已退出。\n'
+      exit 0
+    fi
+  else
+    EMPTY_HITS=0
+  fi
+  printf -v "$1" '%s' "$REPLY"
 }
 
 sata_ver_of() {
@@ -1349,7 +1372,7 @@ choose_devices() {
     hr2; printf '              选择测试目标设备\n'; hr2
     list_devices
     printf '\n  输入编号(空格分隔，如 1 3)、a=全选、n=全不选、回车返回: '
-    local in; in=$(ask)
+    local in; readinto in }
     [[ -z "$in" ]] && return
     case "$in" in
       a|A|all) SEL=("${DEV_LIST[@]}"); continue ;;
@@ -1380,14 +1403,14 @@ set_params() {
     printf '  6) 统一测试目录     当前: %s\n' "${TEST_DIR_OVERRIDE:-<自动>}"
     printf '  7) 包含内置盘       当前: %s\n' "$([[ $INCLUDE_NONUSB -eq 1 ]] && echo 是 || echo 否)"
     printf '\n  0) 返回\n'
-    printf '\n  选择: '; local c v; c=$(ask)
+    printf '\n  选择: '; local c v; readinto c }
     case "$c" in
-      1) printf '  输入 GB (2-64): '; v=$(ask); if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=2&&v<=64)); then FILE_GB=$v; fi ;;
-      2) printf '  输入秒 (5-300): '; v=$(ask); if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=5&&v<=300)); then RUNTIME=$v; fi ;;
+      1) printf '  输入 GB (2-64): '; readinto v; if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=2&&v<=64)); then FILE_GB=$v; fi ;;
+      2) printf '  输入秒 (5-300): '; readinto v; if [[ "$v" =~ ^[0-9]+$ ]] && ((v>=5&&v<=300)); then RUNTIME=$v; fi ;;
       3) DO_WRITE=$(( 1 - DO_WRITE )) ;;
       4) AUTO_MOUNT=$(( 1 - AUTO_MOUNT )) ;;
-      5) printf '  引擎 (libaio/io_uring/psync): '; v=$(ask); if [[ -n "$v" ]]; then IOENGINE=$v; fi ;;
-      6) printf '  绝对路径（留空取消）: '; v=$(ask); if [[ -d "$v" ]]; then TEST_DIR_OVERRIDE=$v; else TEST_DIR_OVERRIDE=""; fi ;;
+      5) printf '  引擎 (libaio/io_uring/psync): '; readinto v; if [[ -n "$v" ]]; then IOENGINE=$v; fi ;;
+      6) printf '  绝对路径（留空取消）: '; readinto v; if [[ -d "$v" ]]; then TEST_DIR_OVERRIDE=$v; else TEST_DIR_OVERRIDE=""; fi ;;
       7) INCLUDE_NONUSB=$(( 1 - INCLUDE_NONUSB )); enumerate_devices ;;
       0) return ;;
     esac
@@ -1403,7 +1426,7 @@ show_results_dir() {
     printf '  [%d] %s\n      %s\n' "$i" "$(basename "$d")" "$(ls "$d" 2>/dev/null | tr '\n' ' ')"
     i=$((i+1))
   done
-  printf '\n  输入编号查看报告（回车返回）: '; local c; c=$(ask)
+  printf '\n  输入编号查看报告（回车返回）: '; local c; readinto c }
   if [[ "$c" =~ ^[0-9]+$ ]]; then
     local p; p=$(ls -1d "$OUT_ROOT"/*/ 2>/dev/null | sort -r | sed -n "${c}p")
     if [[ -n "$p" && -f "$p/报告.md" ]]; then
@@ -1424,7 +1447,7 @@ pick_preset() {
   echo "     0) 返回"
   echo
   printf '   请选择: '
-  local c; c=$(ask)
+  local c; readinto c }
   case "$c" in
     1) QUICK=1; FULL=0; FILE_GB=8;  RUNTIME=10; return 0 ;;
     2) QUICK=0; FULL=0; FILE_GB=16; RUNTIME=30; return 0 ;;
@@ -1448,9 +1471,9 @@ UPD_MARK="USB 外置存储"
 
 http_get() {
   if command -v curl >/dev/null 2>&1; then
-    curl -fsSL --connect-timeout 8 --max-time 30 "$1" 2>/dev/null
+    curl -fsSL --connect-timeout 5 --max-time 15 "$1" 2>/dev/null
   elif command -v wget >/dev/null 2>&1; then
-    wget -qO- --timeout=30 "$1" 2>/dev/null
+    wget -qO- --timeout=15 --tries=1 "$1" 2>/dev/null
   else
     return 127
   fi
@@ -1590,25 +1613,25 @@ main_menu() {
     printf "   ${DK}提示 1=全流程 · 3=看硬件 · 4=查链路 · 6=测并发${N}\n"
     echo
     printf '   请选择: '
-    local c; c=$(ask)
+    local c; readinto c }
     case "$c" in
       1) pick_preset || continue; pick_engine; run_everything
-         printf '\n   回车继续...'; ask >/dev/null ;;
+         printf '\n   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       2) QUICK=1; FULL=0; FILE_GB=8; RUNTIME=10; pick_engine; run_everything
-         printf '\n   回车继续...'; ask >/dev/null ;;
+         printf '\n   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       3) enumerate_devices; show_system_info text
-         printf '   回车继续...'; ask >/dev/null ;;
+         printf '   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       4) enumerate_devices; audit_topology
-         printf '   回车继续...'; ask >/dev/null ;;
+         printf '   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       5) pick_preset || continue; pick_engine; enumerate_devices; run_suite
-         printf '\n   回车继续...'; ask >/dev/null ;;
+         printf '\n   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       6) pick_engine; enumerate_devices; start_run; bench_multi read; gen_report; cleanup_mounts
-         printf '\n   回车继续...'; ask >/dev/null ;;
+         printf '\n   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       7) choose_devices ;;
       8) set_params ;;
       9) show_results_dir ;;
       10) do_update
-          printf '\n   回车继续...'; ask >/dev/null ;;
+          printf '\n   回车继续...'; ask || { printf '\n'; exit 0; } ;;
       0) printf '\n   再见。\n\n'; exit 0 ;;
       *) ;;
     esac
@@ -1632,6 +1655,7 @@ usb-bench.sh v$VERSION — USB 外置存储链路极限速率一键测试
   --auto              无需交互直接跑完全流程
   --sysinfo           打印系统与硬件信息后退出
   --update, -u        检查并更新到最新版
+  --version, -V       显示版本号
   --quick             快速: 8GB 文件 / 10s 随机
   --full              极限: 32GB 文件 / 60s 随机
   --size N            自定义测试文件 GB (2-64)
@@ -1688,7 +1712,7 @@ main() {
   fi
   if ! ensure_deps; then
     printf '\n  依赖不满足，无法继续。按回车退出...'
-    ask >/dev/null || true
+    ask || true
     exit 1
   fi
 
@@ -1709,7 +1733,9 @@ main() {
   main_menu
 }
 
-trap 'cleanup_mounts' EXIT INT TERM
+trap 'cleanup_mounts' EXIT
+trap 'cleanup_mounts; exit 130' INT
+trap 'cleanup_mounts; exit 143' TERM
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -1718,6 +1744,7 @@ while [[ $# -gt 0 ]]; do
     --sysinfo)     SYSINFO_ONLY=1 ;;
     -u|--update)   UPDATE_ONLY=1 ;;
     --no-sysinfo)  NO_SYSINFO=1 ;;
+    -V|--version)  printf 'usb-bench v%s\n' "$VERSION"; exit 0 ;;
     --no-install)  NO_INSTALL=1 ;;
     --quick)       QUICK=1; FILE_GB=8; RUNTIME=10 ;;
     --full)        FULL=1; FILE_GB=32; RUNTIME=60 ;;
