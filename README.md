@@ -16,43 +16,47 @@ USB / UASP 外置存储 —— 链路极限速率一键测试。
 
 ## 一键运行
 
-一条命令，下载即运行：
-
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash
+curl -fsSL https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/install.sh | sudo bash
 ```
 
-脚本的交互输入走 `/dev/tty`，所以管道方式下菜单照样能操作，不用担心读不到键盘。
+国内 `raw.githubusercontent.com` 常被 DNS 污染或劫持，返回一个 200 的 HTML 拦截页——
+`curl -f` 拦不住这种（状态码不是 4xx/5xx），HTML 被管道喂给 bash 就会报
+`syntax error near unexpected token 'newline'`。
 
-带参数（全自动 / 只看硬件信息）：
+所以入口换成了 `install.sh` 引导脚本，它做两件事：
+
+1. **多源回退**：依次尝试 jsDelivr → raw.githubusercontent → ghproxy → gitmirror，谁先成功用谁
+2. **内容校验**：下载后检查首行是 `#!...bash`、正文含脚本标记，校验不过就跳过该源
+
+校验通过才安装到 `/usr/local/bin/usb-bench` 并执行，之后可以直接 `sudo usb-bench`。
+装完不会把 HTML 当脚本跑。
+
+如果不能访问任何镜像，直接在浏览器打开
+[仓库页面](https://github.com/SupportSpark/usb-bench) 下载 `usb-bench.sh` 后
+`chmod +x` 手动运行。
+
+带参数：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash -s -- --auto
-curl -fsSL https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh | sudo bash -s -- --sysinfo
-```
-
-想装到本地反复用（推荐，之后可以直接 `sudo usb-bench`）：
-
-```bash
-sudo curl -fsSL -o /usr/local/bin/usb-bench https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh
-sudo chmod +x /usr/local/bin/usb-bench
-sudo usb-bench
+curl -fsSL https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/install.sh | sudo bash -s -- --auto
+curl -fsSL https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/install.sh | sudo bash -s -- --sysinfo
 ```
 
 ## 更新
 
 ```bash
-sudo usb-bench.sh --update
+sudo usb-bench --update
 ```
 
-或菜单里选 **10. 一键更新脚本**。逻辑：
+或菜单里选 **10. 一键更新脚本**。更新同样走多源回退，不依赖单一 raw 地址。
 
 | 情况 | 行为 |
 |---|---|
 | 上游版本更高 | 备份当前为 `<路径>.bak`，替换并保持 755 权限，提示新旧版本号 |
 | 已在最新 | 直接提示，不动文件 |
-| 当前是管道运行的（没有本地文件） | 自动安装到 `/usr/local/bin/usb-bench`，之后 `sudo usb-bench` 即可 |
-| 下载内容校验不通过 | 放弃覆盖，避免把半截文件写成脚本 |
+| 当前是管道运行的（没有本地文件） | 自动安装到 `/usr/local/bin/usb-bench` |
+| 下载内容校验不通过 | 放弃该源并尝试下一个，实在不行就退出，避免写坏脚本 |
 
 ## 零配置：依赖自动装
 

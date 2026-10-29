@@ -410,12 +410,12 @@ uptime_cn() {
 }
 
 cpu_freq_ghz() {
-  local m
-  m=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/{gsub(/ /,"",$2); print $2}' | head -1)
-  if [[ -z "$m" ]]; then
-    m=$(awk -F':' '/cpu MHz/{gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo 2>/dev/null)
-  fi
-  if [[ -n "$m" ]]; then awk -v m="$m" 'BEGIN{printf "%.2f GHz", m/1000}'; else printf '未知'; fi
+  local a b m
+  a=$(lscpu 2>/dev/null | awk -F: '/CPU max MHz/{gsub(/ /,"",$2); print $2}' | head -1)
+  b=$(awk -F':' '/cpu MHz/{gsub(/ /,"",$2); if ($2+0 > mx) mx=$2+0} END{if (mx>0) printf "%.0f", mx}' /proc/cpuinfo 2>/dev/null)
+  m=$(awk -v a="${a:-0}" -v b="${b:-0}" 'BEGIN{x = (a+0 > b+0) ? a+0 : b+0; printf "%.0f", x}')
+  if [[ -z "$m" || "$m" == "0" ]]; then printf '未知'; return; fi
+  awk -v m="$m" 'BEGIN{printf "%.2f GHz", m/1000}'
 }
 
 show_system_info() {
@@ -1354,7 +1354,7 @@ do_update() {
   local target tmp rver lver
   tit "检查更新"
   target=$(self_path)
-  inf "上游地址: $UPD_URL"
+  inf "将依次尝试多个镜像源"
   inf "安装位置: $target"
 
   if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
@@ -1363,18 +1363,29 @@ do_update() {
     return 1
   fi
 
-  tmp=$(mktemp /tmp/usb-bench.XXXXXX) || { err "无法创建临时文件"; return 1; }
-  if ! http_get "$UPD_URL" > "$tmp"; then
-    rm -f "$tmp"
-    err "拉取失败，请检查网络、代理或仓库地址"
-    return 1
-  fi
+  local urls=() u got=""
+  if [[ -n "${USB_BENCH_URL:-}" ]]; then urls+=("$USB_BENCH_URL"); fi
+  urls+=(
+    "https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/usb-bench.sh"
+    "https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
+    "https://ghproxy.net/https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
+  )
 
-  if ! grep -q "$UPD_MARK" "$tmp" 2>/dev/null; then
+  tmp=$(mktemp /tmp/usb-bench.XXXXXX) || { err "无法创建临时文件"; return 1; }
+  for u in "${urls[@]}"; do
+    inf "尝试: $u"
+    if http_get "$u" > "$tmp" 2>/dev/null && grep -q "$UPD_MARK" "$tmp" 2>/dev/null; then
+      got="$u"; break
+    fi
+  done
+
+  if [[ -z "$got" ]]; then
     rm -f "$tmp"
-    err "下载内容校验失败（不是本脚本），已放弃"
+    err "所有更新源均失败（可能被网络拦截）"
+    err "可设置 USB_BENCH_URL 指定可用地址后重试"
     return 1
   fi
+  ok "来源: $got"
 
   rver=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -1)
   lver="$VERSION"
