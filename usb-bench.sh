@@ -1492,35 +1492,44 @@ do_update() {
     "https://ghproxy.net/https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
   )
 
+  local best bestver=""
   tmp=$(mktemp /tmp/usb-bench.XXXXXX) || { err "无法创建临时文件"; return 1; }
+  best=$(mktemp /tmp/usb-bench.best.XXXXXX) || { err "无法创建临时文件"; rm -f "$tmp"; return 1; }
+
+  # 取所有可用源里版本号最高的: jsDelivr 对 @main 有缓存, 可能落后于 GitHub
   for u in "${urls[@]}"; do
     inf "尝试: $u"
     if http_get "$u" > "$tmp" 2>/dev/null && grep -q "$UPD_MARK" "$tmp" 2>/dev/null; then
-      got="$u"; break
+      local v
+      v=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" 2>/dev/null | head -1)
+      inf "  版本 ${v:-未知}"
+      if [[ -z "$bestver" ]] || [[ "$(printf '%s\n%s\n' "$bestver" "${v:-0}" | sort -V | tail -1)" == "${v:-0}" && "${v:-0}" != "$bestver" ]]; then
+        cp -f "$tmp" "$best" && bestver="${v:-0}" && got="$u"
+      fi
     fi
   done
 
   if [[ -z "$got" ]]; then
-    rm -f "$tmp"
+    rm -f "$tmp" "$best"
     err "所有更新源均失败（可能被网络拦截）"
     err "可设置 USB_BENCH_URL 指定可用地址后重试"
     return 1
   fi
   ok "来源: $got"
 
-  rver=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$tmp" | head -1)
+  rver=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$best" | head -1)
   lver="$VERSION"
   if [[ -z "$rver" ]]; then
-    rm -f "$tmp"; err "无法解析上游版本号"; return 1
+    rm -f "$tmp" "$best"; err "无法解析上游版本号"; return 1
   fi
 
   if [[ "$rver" == "$lver" ]]; then
-    rm -f "$tmp"
+    rm -f "$tmp" "$best"
     ok "当前 v$lver 已是最新版本"
     return 0
   fi
   if ! ver_newer "$rver" "$lver"; then
-    rm -f "$tmp"
+    rm -f "$tmp" "$best"
     wrn "上游 v$rver 不高于当前 v$lver，保持现状"
     return 0
   fi
@@ -1530,9 +1539,9 @@ do_update() {
     cp -f "$target" "$target.bak" 2>/dev/null && inf "已备份旧版本: $target.bak"
   fi
 
-  if install -m 755 "$tmp" "$target" 2>/dev/null \
-     || { cp -f "$tmp" "$target" && chmod 755 "$target"; }; then
-    rm -f "$tmp"
+  if install -m 755 "$best" "$target" 2>/dev/null \
+     || { cp -f "$best" "$target" && chmod 755 "$target"; }; then
+    rm -f "$tmp" "$best"
     ok "更新完成: v$lver → v$rver"
     if [[ "$target" != "$SELF" ]]; then
       inf "下次可直接运行: sudo $target"
@@ -1542,7 +1551,7 @@ do_update() {
     return 0
   fi
 
-  rm -f "$tmp"
+  rm -f "$tmp" "$best"
   err "写入失败: $target（权限不足？）"
   return 1
 }

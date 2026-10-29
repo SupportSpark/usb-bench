@@ -41,15 +41,22 @@ SOURCES+=(
 )
 
 TMP=$(mktemp /tmp/usb-bench.XXXXXX) || die "无法创建临时文件"
+BEST=$(mktemp /tmp/usb-bench.best.XXXXXX) || die "无法创建临时文件"
 GOT=""
+BEST_VER=""
 
+# 不取第一个成功的源: jsDelivr 对 @main 有缓存, 可能落后于 GitHub。
+# 遍历所有源, 装版本号最高的那个。
 for u in "${SOURCES[@]}"; do
   [[ -z "$u" ]] && continue
   printf '[ .. ] 尝试 %s\n' "$u"
   if fetch "$u" > "$TMP" 2>/dev/null; then
     if head -1 "$TMP" 2>/dev/null | grep -q 'bash' && grep -q "$MARK" "$TMP" 2>/dev/null; then
-      GOT="$u"
-      break
+      v=$(sed -n 's/^VERSION="\(.*\)"/\1/p' "$TMP" 2>/dev/null | head -1)
+      printf '       版本 %s\n' "${v:-未知}"
+      if [[ -z "$BEST_VER" ]] || [[ "$(printf '%s\n%s\n' "$BEST_VER" "${v:-0}" | sort -V | tail -1)" == "${v:-0}" && "${v:-0}" != "$BEST_VER" ]]; then
+        cp -f "$TMP" "$BEST" && BEST_VER="${v:-0}" && GOT="$u"
+      fi
     else
       printf '       内容不是脚本（可能被网络劫持），跳过\n'
     fi
@@ -71,18 +78,19 @@ if [[ -z "$GOT" ]]; then
   再重新运行本命令"
 fi
 
-printf '[ OK ] 下载成功：%s\n' "$GOT"
+printf '[ OK ] 选用 %s（v%s）\n' "$GOT" "$BEST_VER"
 
-if install -m 755 "$TMP" "$TARGET" 2>/dev/null \
-   || { command -v sudo >/dev/null 2>&1 && sudo install -m 755 "$TMP" "$TARGET" 2>/dev/null; }; then
+if install -m 755 "$BEST" "$TARGET" 2>/dev/null \
+   || { command -v sudo >/dev/null 2>&1 && sudo install -m 755 "$BEST" "$TARGET" 2>/dev/null; }; then
   printf '[ OK ] 已安装到 %s\n\n' "$TARGET"
 else
   warn "无法写入 $TARGET，改为直接运行临时文件"
-  TARGET="$TMP"
+  TARGET="$BEST"
   chmod 755 "$TARGET" 2>/dev/null
 fi
 
 if [[ "$TARGET" != "$TMP" ]]; then rm -f "$TMP" 2>/dev/null || true; fi
+if [[ "$TARGET" != "$BEST" ]]; then rm -f "$BEST" 2>/dev/null || true; fi
 
 if [[ "$(id -u)" -eq 0 ]]; then
   exec "$TARGET" "$@"
