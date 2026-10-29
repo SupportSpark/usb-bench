@@ -11,7 +11,7 @@
 set -uo pipefail
 LC_ALL=C
 
-VERSION="1.4.0"
+VERSION="1.5.0"
 SELF=$(readlink -f "$0")
 
 if [[ -t 1 ]]; then
@@ -45,6 +45,22 @@ ask() {
   printf '%s' "$__a"
 }
 
+sata_ver_of() {
+  local dev=$1 out
+  out=$(smartctl -i "/dev/$dev" 2>/dev/null | grep -m1 -i 'SATA Version is' || true)
+  [[ -z "$out" ]] && return 1
+  printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+ Gb/s' | head -1 | awk '{print $1}'
+}
+
+media_type_of() {  # SSD | HDD（USB 桥常把 SSD 报成 rotational）
+  local dev=$1 rota out
+  rota=${D_ROTA[$dev]:-1}
+  out=$(smartctl -i "/dev/$dev" 2>/dev/null | grep -i 'Rotation Rate' || true)
+  if [[ "$out" == *"Solid State"* ]]; then printf 'SSD'; return 0; fi
+  if [[ -n "$out" ]]; then printf 'HDD'; return 0; fi
+  if [[ "$rota" == "0" ]]; then printf 'SSD'; else printf 'HDD'; fi
+}
+
 
 BASE_DIR="${USB_BENCH_HOME:-$HOME/.usb-bench}"
 OUT_ROOT="${USB_BENCH_REPORTS:-$HOME/usb-bench-reports}"
@@ -54,7 +70,7 @@ OUT_DIR=""
 LOG_FILE=""
 
 DEV_LIST=()
-declare -A D_SIZE D_MODEL D_SER D_SPEED D_DRIVER D_USBPATH D_ROTA D_SATA D_FS D_MP D_VIDPID D_USBVER
+declare -A D_SIZE D_MODEL D_SER D_SPEED D_DRIVER D_USBPATH D_ROTA D_SATA D_FS D_MP D_VIDPID D_USBVER D_TYPE
 SEL=()
 
 declare -A R_BW R_IOPS R_LAT
@@ -508,7 +524,7 @@ show_system_info() {
     nm=$(kv NAME "$d"); sz=$(kv SIZE "$d"); md=$(kv MODEL "$d")
     rota=$(kv ROTA "$d"); tran=$(kv TRAN "$d"); mnt=$(kv MOUNTPOINTS "$d")
     case "$nm" in loop*|sr*) continue ;; esac
-    [[ "$rota" == "0" ]] && typ="SSD" || typ="HDD"
+    typ=${D_TYPE[$nm]:-HDD}
     [[ -z "$mnt" ]] && mnt="-"
     printf '%s%s%s%s%s%s\n' \
       "$(pad_to "$nm" 8)" "$(pad_to "${md:0:30}" 30)" "$(pad_to "$sz" 10)" \
@@ -524,17 +540,15 @@ show_system_info() {
   if [[ -z "$rows" ]]; then
     printf '未发现 USB 控制器或 NVMe 桥（lspci 不可用）\n'
   else
-    printf '%s%s%s%s%s\n' \
-      "$(pad_to "地址" 12)" "$(pad_to "设备" 46)" "$(pad_to "速率" 9)" \
-      "$(pad_to "宽度" 6)" "可用带宽"
     local slot desc sp wd tot
     while IFS='|' read -r slot desc sp wd tot; do
       [[ -z "$slot" ]] && continue
-      printf '%s%s%s%s%s MB/s\n' \
-        "$(pad_to "$slot" 12)" "$(pad_to "$desc" 46)" "$(pad_to "$sp" 9)" \
-        "$(pad_to "$wd" 6)" "$tot"
+      printf '%s  %s\n' "$slot" "$desc"
+      printf '           协商 %s x%s，可用带宽 %s MB/s\n' "$sp" "$wd" "$tot"
       if (( tot > 0 && tot < 1050 )); then
-        printf '  注意: 该控制器 PCIe 上行仅 %s MB/s，低于单口 10Gbps(1050 MB/s)\n' "$tot"
+        printf '           注意: 该控制器 PCIe 上行低于单口 10Gbps(1050 MB/s)，插 10Gbps 设备也跑不满\n'
+      elif (( tot >= 1050 && tot < 2000 )); then
+        printf '           注意: 上行约 %s MB/s，双口 10Gbps 同时满载(约2100 MB/s)会受限\n' "$tot"
       fi
     done <<<"$rows"
   fi
@@ -576,13 +590,13 @@ first_partition() {
   return 0
 }
 
-fs_of() { blkid -o value -s TYPE "/dev/$1" 2>/dev/null | head -1; }
-
-sata_ver_of() {
-  local dev=$1 out
-  out=$(smartctl -i "/dev/$dev" 2>/dev/null | grep -m1 -i 'SATA Version is' || true)
-  [[ -z "$out" ]] && return 1
-  printf '%s' "$out" | grep -oE '[0-9]+\.[0-9]+ Gb/s' | head -1 | awk '{print $1}'
+fs_of() {  # 文件系统类型，blkid 失败时回退 lsblk
+  local t
+  t=$(blkid -o value -s TYPE "/dev/$1" 2>/dev/null | head -1)
+  if [[ -z "$t" ]]; then
+    t=$(lsblk -P -n -o FSTYPE "/dev/$1" 2>/dev/null | sed -n 's/.*FSTYPE="\([^"]*\)".*/\1/p' | head -1)
+  fi
+  printf '%s' "$t"
 }
 
 enumerate_devices() {
@@ -619,6 +633,7 @@ enumerate_devices() {
     mp=$(first_mount_of "$name" || true)
     D_MP[$name]="$mp"
     D_SATA[$name]=$(sata_ver_of "$name" || true)
+    D_TYPE[$name]=$(media_type_of "$name")
   done < <(lsblk -P -d -b -o NAME,TYPE,SIZE,TRAN,ROTA,MODEL,SERIAL 2>/dev/null)
 
   local d
@@ -731,7 +746,7 @@ audit_topology() {
   for d in "${DEV_LIST[@]}"; do
     sp=${D_SPEED[$d]:-0}
     if [[ "$sp" -gt 0 && "${D_DRIVER[$d]:-}" != "uas" ]]; then
-      printf '   %s: 走 BOT 协议（非 UASP），通常损失 15~30%%%% 带宽\n' "$d"; any=1
+      printf '   %s: 走 BOT 协议（非 UASP），通常损失 15~30%% 带宽\n' "$d"; any=1
     fi
     if [[ "$sp" == "480" ]]; then
       printf '   %s: 插在 USB 2.0 端口，上限仅 43 MB/s，请换 USB3 口或换线\n' "$d"; any=1
@@ -740,6 +755,17 @@ audit_topology() {
       printf '   %s: SATA 6Gbps(约550MB/s) 低于 USB 10Gbps(约1050MB/s)，单盘跑不满链路属正常\n' "$d"; any=1
     fi
   done
+  # 控制器/集线器有 10Gbps 能力，但设备只协商到 5Gbps
+  local l10=0 n5=0
+  if command -v lsusb >/dev/null 2>&1 && lsusb -t 2>/dev/null | grep -q '10000M'; then l10=1; fi
+  for d in "${DEV_LIST[@]}"; do
+    [[ "${D_SPEED[$d]:-0}" == "5000" ]] && n5=$((n5+1))
+  done
+  if (( l10 == 1 && n5 > 0 )); then
+    printf '   有 %d 块设备协商在 5Gbps，而系统存在 10Gbps 端口/集线器\n' "$n5"
+    printf '   若硬盘盒标称 10Gbps，检查：线材是否 USB3.2 Gen2、是否插在 10Gbps 口、桥接芯片型号\n'
+    any=1
+  fi
   (( any == 0 )) && printf '   未发现明显配置问题\n'
   dash
   printf '\n'
@@ -754,28 +780,57 @@ cleanup_mounts() {
   MOUNTED_BY_US=()
 }
 
+# 解析可测试目标
+#   rc=0 输出目录路径（文件级测试）
+#   rc=2 无文件系统（应改用裸设备只读测试）
+#   rc=1 不可测试
+# 所有诊断走 stderr，避免被 $( ) 吞掉
 test_dir_for() {
-  local d=$1 mnt part fst
+  local d=$1 mnt part fst err
   if [[ -n "$TEST_DIR_OVERRIDE" ]]; then printf '%s' "$TEST_DIR_OVERRIDE"; return 0; fi
+
   mnt=$(first_mount_of "$d" || true)
   if [[ -n "$mnt" ]]; then
     if [[ -w "$mnt" ]]; then printf '%s' "$mnt"; return 0; fi
-    wrn "$d 挂载点 $mnt 不可写"; return 1
+    printf '  [WARN] /dev/%s 挂载点 %s 不可写\n' "$d" "$mnt" >&2
+    return 1
   fi
-  if [[ "$AUTO_MOUNT" -eq 1 ]]; then
-    part=$(first_partition "$d" || true)
-    if [[ -z "$part" ]]; then part="$d"; fi
-    fst=$(fs_of "$part" || true)
-    if [[ -z "$fst" ]]; then wrn "$d 无文件系统（未分区或裸盘），跳过文件级测试"; return 1; fi
-    if [[ "$fst" == "ntfs" ]] && ! command -v ntfs-3g >/dev/null 2>&1; then
-      wrn "$d 为 NTFS，请先 apt install ntfs-3g"; return 1
-    fi
-    mnt="$MOUNT_ROOT/$d"
-    mkdir -p "$mnt"
-    if mount -t "$fst" -o noatime "/dev/$part" "$mnt" 2>/dev/null; then
+
+  if [[ "$AUTO_MOUNT" -ne 1 ]]; then
+    printf '  [WARN] /dev/%s 未挂载，且已禁用自动挂载（--no-mount）\n' "$d" >&2
+    return 1
+  fi
+
+  part=$(first_partition "$d" || true)
+  [[ -z "$part" ]] && part="$d"
+  fst=$(fs_of "$part" || true)
+
+  mnt="$MOUNT_ROOT/$d"
+  mkdir -p "$mnt"
+
+  # 先按已知类型挂载，未知类型交给内核自动探测
+  if [[ -n "$fst" ]]; then
+    if mount -t "$fst" -o noatime "/dev/$part" "$mnt" 2>/tmp/.ub_mnt_err; then
       MOUNTED_BY_US+=("$mnt"); printf '%s' "$mnt"; return 0
     fi
-    wrn "$d 自动挂载失败（可能已被占用）"; return 1
+  else
+    if mount -o noatime "/dev/$part" "$mnt" 2>/tmp/.ub_mnt_err; then
+      MOUNTED_BY_US+=("$mnt"); printf '%s' "$mnt"; return 0
+    fi
+  fi
+
+  err=$(head -2 /tmp/.ub_mnt_err 2>/dev/null | tr '\n' ' ')
+  rm -f /tmp/.ub_mnt_err 2>/dev/null
+
+  if [[ -z "$fst" ]]; then
+    printf '  [WARN] /dev/%s 没有可识别的文件系统（未格式化或裸盘）\n' "$d" >&2
+    printf '         将改为裸设备只读测试（不写入，不破坏数据）\n' >&2
+    return 2
+  fi
+
+  printf '  [WARN] /dev/%s 挂载失败: %s\n' "$d" "${err:-未知原因}" >&2
+  if [[ "$fst" == "ntfs" ]] && ! command -v ntfs-3g >/dev/null 2>&1; then
+    printf '         请先安装 ntfs-3g: sudo apt install -y ntfs-3g\n' >&2
   fi
   return 1
 }
@@ -819,20 +874,36 @@ show_result() {
   printf '\n'
 }
 
-bench_sequential() {
-  local d=$1 dir=$2 size=$3 f=$2/.usb_bench_$1.dat j bw io lat cur=0
-  inf "[$d] 准备测试文件 ${size}GB @ $dir"
+set_fio_tgt() {  # dev path kind size -> 全局 FIO_TGT
+  FIO_TGT=()
+  if [[ "$3" == "raw" ]]; then
+    FIO_TGT=("--filename=/dev/$1" "--time_based=1" "--runtime=$RUNTIME")
+  else
+    FIO_TGT=("--filename=$2/.usb_bench_$1.dat" "--size=${4}G")
+  fi
+}
 
-  if [[ -f "$f" ]]; then cur=$(stat -c%s "$f" 2>/dev/null || echo 0); fi
-  if (( cur < size*1024*1024*1024 )); then
-    fio --name=prefill --filename="$f" --size="${size}G" --rw=write --bs=8M \
-        --ioengine="$IOENGINE" --direct=1 --iodepth=4 --numjobs=1 --end_fsync=1 \
-        --output-format=json >/dev/null 2>>"$LOG_FILE"
-    if [[ $? -ne 0 ]]; then wrn "[$d] 预填失败（空间不足或只读）"; return 1; fi
+bench_sequential() {  # dev path size kind
+  local d=$1 dir=$2 size=$3 kind=$4 f j bw io lat cur=0
+  f="$dir/.usb_bench_$d.dat"
+
+  if [[ "$kind" == "file" ]]; then
+    inf "[$d] 准备测试文件 ${size}GB @ $dir"
+    [[ -f "$f" ]] && cur=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    if (( cur < size*1024*1024*1024 )); then
+      fio --name=prefill --filename="$f" --size="${size}G" --rw=write --bs=8M \
+          --ioengine="$IOENGINE" --direct=1 --iodepth=4 --numjobs=1 --end_fsync=1 \
+          --output-format=json >/dev/null 2>>"$LOG_FILE"
+      if [[ $? -ne 0 ]]; then wrn "[$d] 预填失败（空间不足或只读）"; return 1; fi
+    fi
+  else
+    inf "[$d] 裸设备只读测试（不写入，不破坏数据）"
   fi
 
+  set_fio_tgt "$d" "$dir" "$kind" "$size"
+
   inf "[$d] 顺序读 1M QD8 ..."
-  j=$(fio --name=sread --filename="$f" --size="${size}G" --rw=read --bs=1M \
+  j=$(fio --name=sread "${FIO_TGT[@]}" --rw=read --bs=1M \
         --ioengine="$IOENGINE" --direct=1 --iodepth=8 --numjobs=1 \
         --group_reporting --output-format=json --eta=never 2>>"$LOG_FILE")
   bw=$(fio_bw "$j" read); io=$(fio_iops "$j" read); lat=$(fio_lat "$j" read)
@@ -840,70 +911,80 @@ bench_sequential() {
   record "$d" "SEQ1M_QD8_READ" "$bw" "$io" "$lat"
   printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_seq_read.json"
 
-  if [[ "$DO_WRITE" -eq 1 ]]; then
-    inf "[$d] 顺序写 1M QD8 ..."
-    j=$(fio --name=swrite --filename="$f" --size="${size}G" --rw=write --bs=1M \
-          --ioengine="$IOENGINE" --direct=1 --iodepth=8 --numjobs=1 \
-          --group_reporting --output-format=json --eta=never 2>>"$LOG_FILE")
-    bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
-    show_result "顺序写 1M QD8" "$bw" "$io" "$lat" "$(lt "${D_SPEED[$d]}" 4)"
-    record "$d" "SEQ1M_QD8_WRITE" "$bw" "$io" "$lat"
-    printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_seq_write.json"
+  if [[ "$kind" == "raw" ]]; then
+    inf "[$d] 裸设备跳过顺序写（避免破坏数据）"
+    return 0
   fi
-  return 0
+  if [[ "$DO_WRITE" -ne 1 ]]; then return 0; fi
+
+  inf "[$d] 顺序写 1M QD8 ..."
+  j=$(fio --name=swrite "${FIO_TGT[@]}" --rw=write --bs=1M \
+        --ioengine="$IOENGINE" --direct=1 --iodepth=8 --numjobs=1 \
+        --group_reporting --output-format=json --eta=never 2>>"$LOG_FILE")
+  bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
+  show_result "顺序写 1M QD8" "$bw" "$io" "$lat" "$(lt "${D_SPEED[$d]}" 4)"
+  record "$d" "SEQ1M_QD8_WRITE" "$bw" "$io" "$lat"
+  printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_seq_write.json"
 }
 
-bench_random() {
-  local d=$1 dir=$2 size=$3 f=$2/.usb_bench_$1.dat j bw io lat rt=$RUNTIME
+bench_random() {  # dev path size kind
+  local d=$1 dir=$2 size=$3 kind=$4 j bw io lat
+  set_fio_tgt "$d" "$dir" "$kind" "$size"
+
   inf "[$d] 4K 随机读 QD1 ..."
-  j=$(fio --name=r4k1 --filename="$f" --size="${size}G" --rw=randread --bs=4k \
+  j=$(fio --name=r4k1 "${FIO_TGT[@]}" --rw=randread --bs=4k \
         --ioengine="$IOENGINE" --direct=1 --iodepth=1 --numjobs=1 --time_based=1 \
-        --runtime=$rt --group_reporting --norandommap=1 --randrepeat=0 \
+        --runtime="$RUNTIME" --group_reporting --norandommap=1 --randrepeat=0 \
         --output-format=json --eta=never 2>>"$LOG_FILE")
   bw=$(fio_bw "$j" read); io=$(fio_iops "$j" read); lat=$(fio_lat "$j" read)
   show_result "4K 随机读 QD1" "$bw" "$io" "$lat" ""
   record "$d" "RND4K_QD1_READ" "$bw" "$io" "$lat"
-  printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_rnd4k_qd1_read.json"
 
   inf "[$d] 4K 随机读 QD32 ..."
-  j=$(fio --name=r4k32 --filename="$f" --size="${size}G" --rw=randread --bs=4k \
+  j=$(fio --name=r4k32 "${FIO_TGT[@]}" --rw=randread --bs=4k \
         --ioengine="$IOENGINE" --direct=1 --iodepth=32 --numjobs=1 --time_based=1 \
-        --runtime=$rt --group_reporting --norandommap=1 --randrepeat=0 \
+        --runtime="$RUNTIME" --group_reporting --norandommap=1 --randrepeat=0 \
         --output-format=json --eta=never 2>>"$LOG_FILE")
   bw=$(fio_bw "$j" read); io=$(fio_iops "$j" read); lat=$(fio_lat "$j" read)
   show_result "4K 随机读 QD32" "$bw" "$io" "$lat" ""
   record "$d" "RND4K_QD32_READ" "$bw" "$io" "$lat"
-  printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_rnd4k_qd32_read.json"
 
-  if [[ "$DO_WRITE" -eq 1 ]]; then
-    inf "[$d] 4K 随机写 QD1 ..."
-    j=$(fio --name=w4k1 --filename="$f" --size="${size}G" --rw=randwrite --bs=4k \
-          --ioengine="$IOENGINE" --direct=1 --iodepth=1 --numjobs=1 --time_based=1 \
-          --runtime=$rt --group_reporting --norandommap=1 --randrepeat=0 \
-          --output-format=json --eta=never 2>>"$LOG_FILE")
-    bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
-    show_result "4K 随机写 QD1" "$bw" "$io" "$lat" ""
-    record "$d" "RND4K_QD1_WRITE" "$bw" "$io" "$lat"
-
-    inf "[$d] 4K 随机写 QD32 ..."
-    j=$(fio --name=w4k32 --filename="$f" --size="${size}G" --rw=randwrite --bs=4k \
-          --ioengine="$IOENGINE" --direct=1 --iodepth=32 --numjobs=1 --time_based=1 \
-          --runtime=$rt --group_reporting --norandommap=1 --randrepeat=0 \
-          --output-format=json --eta=never 2>>"$LOG_FILE")
-    bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
-    show_result "4K 随机写 QD32" "$bw" "$io" "$lat" ""
-    record "$d" "RND4K_QD32_WRITE" "$bw" "$io" "$lat"
-    printf '%s\n' "$j" > "$OUT_DIR/raw/${d}_rnd4k_qd32_write.json"
+  if [[ "$kind" == "raw" ]]; then
+    inf "[$d] 裸设备跳过随机写（避免破坏数据）"
+    return 0
   fi
-  return 0
+  if [[ "$DO_WRITE" -ne 1 ]]; then return 0; fi
+
+  inf "[$d] 4K 随机写 QD1 ..."
+  j=$(fio --name=w4k1 "${FIO_TGT[@]}" --rw=randwrite --bs=4k \
+        --ioengine="$IOENGINE" --direct=1 --iodepth=1 --numjobs=1 --time_based=1 \
+        --runtime="$RUNTIME" --group_reporting --norandommap=1 --randrepeat=0 \
+        --output-format=json --eta=never 2>>"$LOG_FILE")
+  bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
+  show_result "4K 随机写 QD1" "$bw" "$io" "$lat" ""
+  record "$d" "RND4K_QD1_WRITE" "$bw" "$io" "$lat"
+
+  inf "[$d] 4K 随机写 QD32 ..."
+  j=$(fio --name=w4k32 "${FIO_TGT[@]}" --rw=randwrite --bs=4k \
+        --ioengine="$IOENGINE" --direct=1 --iodepth=32 --numjobs=1 --time_based=1 \
+        --runtime="$RUNTIME" --group_reporting --norandommap=1 --randrepeat=0 \
+        --output-format=json --eta=never 2>>"$LOG_FILE")
+  bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write); lat=$(fio_lat "$j" write)
+  show_result "4K 随机写 QD32" "$bw" "$io" "$lat" ""
+  record "$d" "RND4K_QD32_WRITE" "$bw" "$io" "$lat"
 }
 
-bench_mixed() {
-  local d=$1 dir=$2 size=$3 f=$2/.usb_bench_$1.dat j bw io lat
+bench_mixed() {  # dev path size kind
+  local d=$1 dir=$2 size=$3 kind=$4 j bw io lat
+  if [[ "$kind" == "raw" && "$DO_WRITE" -eq 1 ]]; then
+    inf "[$d] 裸设备跳过写/混合测试（避免破坏数据）"
+    return 0
+  fi
+  set_fio_tgt "$d" "$dir" "$kind" "$size"
   inf "[$d] 混合读写 70/30 4K QD16 ..."
-  j=$(fio --name=mix --filename="$f" --size="${size}G" --rw=randrw --rwmixread=70 \
-        --bs=4k --ioengine="$IOENGINE" --direct=1 --iodepth=16 --numjobs=1 \
-        --time_based=1 --runtime=$RUNTIME --group_reporting --norandommap=1 --randrepeat=0 \
+  j=$(fio --name=mix "${FIO_TGT[@]}" --rw=randrw --rwmixread=70 --bs=4k \
+        --ioengine="$IOENGINE" --direct=1 --iodepth=16 --numjobs=1 --time_based=1 \
+        --runtime="$RUNTIME" --group_reporting --norandommap=1 --randrepeat=0 \
         --output-format=json --eta=never 2>>"$LOG_FILE")
   bw=$(jq -r '[(.jobs[].read.bw_bytes//0)+(.jobs[].write.bw_bytes//0)]|add//0|./1048576' <<<"$j" 2>/dev/null | head -1)
   io=$(jq -r '[(.jobs[].read.iops//0)+(.jobs[].write.iops//0)]|add//0' <<<"$j" 2>/dev/null | head -1)
@@ -916,34 +997,50 @@ bench_mixed() {
 #------------------------------ 多盘并发 --------------------------------------
 bench_multi() {
   local mode=$1
-  tit "多盘并发 $mode 测试 —— 链路共享上限"
-  local args=() d dir size f cur
+  printf '\n多盘并发 %s 测试 —— 链路共享上限\n' "$mode"
+  dash
+  local args=() d dir rc kind size f anyraw=0 n=0
   for d in "${SEL[@]:-}"; do
     [[ -z "$d" ]] && continue
-    dir=$(test_dir_for "$d") || continue
-    size=$(plan_file_size "$dir")
-    if (( size < 2 )); then continue; fi
-    f="$dir/.usb_bench_$d.dat"
-    if [[ "$mode" == "read" ]]; then
-      cur=0
-      if [[ -f "$f" ]]; then cur=$(stat -c%s "$f" 2>/dev/null || echo 0); fi
-      if (( cur < 1000000000 )); then
-        wrn "[$d] 先做 1GB 预填"
+    dir=$(test_dir_for "$d"); rc=$?
+    if (( rc == 0 )); then
+      kind=file
+    elif (( rc == 2 )); then
+      kind=raw; dir=""
+    else
+      continue
+    fi
+
+    if [[ "$kind" == "raw" ]]; then
+      anyraw=1
+      args+=(--name="job_$d" --filename="/dev/$d")
+      printf '   %s 参与并发（裸设备只读）\n' "$d"
+    else
+      size=$(plan_file_size "$dir")
+      (( size < 2 )) && continue
+      f="$dir/.usb_bench_$d.dat"
+      if [[ ! -f "$f" ]]; then
         fio --name=prefill --filename="$f" --size=1G --rw=write --bs=8M --ioengine="$IOENGINE" \
             --direct=1 --iodepth=4 --numjobs=1 --end_fsync=1 --output-format=json >/dev/null 2>&1 || continue
       fi
+      args+=(--name="job_$d" --filename="$f" --size="${size}G")
+      printf '   %s 参与并发（%sGB 文件）\n' "$d" "$size"
     fi
-    args+=(--name="job_$d" --filename="$f" --size="${size}G")
-    inf "[$d] 参与并发: ${size}GB"
+    n=$((n+1))
   done
-  if (( ${#args[@]} == 0 )); then wrn "没有可用设备"; return; fi
 
-  local n=$(( ${#args[@]} / 3 ))
-  printf '\n    参与设备数: %d\n' "$n"
+  if (( ${#args[@]} == 0 )); then wrn "没有可用设备"; return; fi
+  if [[ "$mode" == "write" && $anyraw -eq 1 ]]; then
+    wrn "含裸设备，写入测试不安全，改为只读"; mode=read
+  fi
+
   local j bw io
-  j=$(fio --rw="$mode" --bs=1M --ioengine="$IOENGINE" --direct=1 \
-        --iodepth=8 --numjobs=1 --group_reporting --output-format=json --eta=never \
-        "${args[@]}" 2>>"$LOG_FILE")
+  # 注意: 不能用 --group_reporting, 该模式下 fio 会把多 job 合并成单条 JSON,
+  # 导致分盘明细丢失。总带宽由 fio_bw 对 .jobs[] 求和得到。
+  j=$(fio --name=global --rw="$mode" --bs=1M --ioengine="$IOENGINE" --direct=1 --iodepth=8 \
+        --numjobs=1 --time_based=1 --runtime="$RUNTIME" \
+        --output-format=json --eta=never "${args[@]}" 2>>"$LOG_FILE")
+
   if [[ "$mode" == "write" ]]; then
     bw=$(fio_bw "$j" write); io=$(fio_iops "$j" write)
   else
@@ -954,12 +1051,12 @@ bench_multi() {
   record "ALL" "MULTI_$(echo $mode | tr a-z A-Z)" "$bw" "$io" 0
   printf '%s\n' "$j" > "$OUT_DIR/raw/all_multi_${mode}.json"
 
-  printf '\n    分盘明细\n'
+  printf '\n   分盘明细\n'
   local i nm val
   for i in $(seq 0 $((n-1))); do
     nm=$(jq -r ".jobs[$i].jobname" <<<"$j" 2>/dev/null)
     val=$(jq -r ".jobs[$i].$mode.bw_bytes//0|./1048576" <<<"$j" 2>/dev/null)
-    printf '      %-24s %8.1f MB/s\n' "$nm" "${val:-0}"
+    printf '      %s %8.1f MB/s\n' "$(pad_to "${nm:-?}" 22)" "${val:-0}"
   done
 }
 
@@ -1195,27 +1292,51 @@ run_suite() {
   hr2
   start_run
 
-  local d dir size
+  local d dir rc size kind okcnt=0 skipcnt=0
   for d in "${SEL[@]}"; do
     tit "测试 /dev/$d — ${D_MODEL[$d]}"
-    dir=$(test_dir_for "$d") || { wrn "[$d] 跳过（无可写挂载点）"; continue; }
-    size=$(plan_file_size "$dir")
-    if (( size < 2 )); then wrn "[$d] 可用空间不足 2GB，跳过"; continue; fi
-    inf "[$d] 测试目录 $dir · 文件 ${size}GB"
-    bench_sequential "$d" "$dir" "$size"
-    bench_random "$d" "$dir" "$size"
-    bench_mixed "$d" "$dir" "$size"
-    rm -f "$dir/.usb_bench_$d.dat" 2>/dev/null
+    dir=$(test_dir_for "$d"); rc=$?
+    if (( rc == 0 )); then
+      kind=file
+    elif (( rc == 2 )); then
+      kind=raw; dir=""
+    else
+      wrn "[$d] 跳过"; skipcnt=$((skipcnt+1)); continue
+    fi
+
+    size=0
+    if [[ "$kind" == "file" ]]; then
+      size=$(plan_file_size "$dir")
+      if (( size < 2 )); then wrn "[$d] 可用空间不足 2GB，跳过"; skipcnt=$((skipcnt+1)); continue; fi
+      inf "[$d] 测试目录 $dir · 文件 ${size}GB"
+    fi
+
+    bench_sequential "$d" "$dir" "$size" "$kind"
+    bench_random "$d" "$dir" "$size" "$kind"
+    bench_mixed "$d" "$dir" "$size" "$kind"
+    [[ "$kind" == "file" ]] && rm -f "$dir/.usb_bench_$d.dat" 2>/dev/null
+    okcnt=$((okcnt+1))
     printf '\n'
   done
 
-  if (( ${#SEL[@]} >= 2 )); then
-    bench_multi read
-  else
-    inf "仅 1 块盘，跳过多盘并发"
+  if (( okcnt == 0 )); then
+    printf '\n'
+    wrn "没有任何设备可测试。请检查："
+    printf '   - 磁盘是否需要先格式化（sudo mkfs.ext4 /dev/sdX1）\n'
+    printf '   - 是否已挂载但不可写（挂载点权限）\n'
+    printf '   - NTFS 盘需安装 ntfs-3g\n'
+    printf '   裸盘会自动走只读测试，无需格式化即可测速\n\n'
   fi
 
-  tit "生成报告"
+  if (( okcnt >= 2 )); then
+    bench_multi read
+  elif (( okcnt == 1 )); then
+    inf "仅 1 块盘可测，跳过多盘并发"
+  fi
+
+  printf '\n'
+  printf '生成报告\n'
+  dash
   gen_report
   cleanup_mounts
   printf '\n  报告目录: %s\n\n' "$OUT_DIR"
