@@ -33,10 +33,11 @@ fi
 
 SOURCES=()
 [[ -n "${USB_BENCH_URL:-}" ]] && SOURCES+=("$USB_BENCH_URL")
+# raw 优先；jsDelivr 放在后面，因为它对 @main 的缓存会滞后数小时
 SOURCES+=(
-  "https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/usb-bench.sh"
   "https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
   "https://ghproxy.net/https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
+  "https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/usb-bench.sh"
   "https://raw.gitmirror.com/SupportSpark/usb-bench/main/usb-bench.sh"
 )
 

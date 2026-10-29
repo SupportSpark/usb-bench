@@ -1510,9 +1510,9 @@ do_update() {
   local urls=() u got=""
   if [[ -n "${USB_BENCH_URL:-}" ]]; then urls+=("$USB_BENCH_URL"); fi
   urls+=(
-    "https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/usb-bench.sh"
     "https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
     "https://ghproxy.net/https://raw.githubusercontent.com/SupportSpark/usb-bench/main/usb-bench.sh"
+    "https://cdn.jsdelivr.net/gh/SupportSpark/usb-bench@main/usb-bench.sh"
   )
 
   local best bestver=""
